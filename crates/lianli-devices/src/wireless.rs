@@ -26,6 +26,7 @@ const USB_CMD_GET_MAC: u8 = 0x11; // USB_GetMac
 // ── RF command codes (from L-Connect 3 RF_CMD enum) ──────────────────────────
 
 const RF_SELECT: u8 = 18; // RF_Select — carries fan PWM data
+const RF_SET_RGB: u8 = 32; // RF_SetRGB (0x20) — carries LED frame data
 
 // ── RF packet geometry ───────────────────────────────────────────────────────
 
@@ -86,6 +87,23 @@ impl WirelessFanType {
             Self::Tlv2Led | Self::SlInf => 11,
             Self::Clv1 => 10,
             Self::Unknown => 10,
+        }
+    }
+
+    /// Number of addressable LEDs per fan for this device type.
+    ///
+    /// From L-Connect 3 decompiled source (RfDevice.cs rgb data arrays):
+    /// - TLV2: 104 LEDs per zone (UP/DOWN combined, ~26 per fan)
+    /// - SLV3: 160 LEDs per zone (inner + outer rings, ~40 per fan)
+    /// - SL-INF: 176 LEDs total across all fans (~44 per fan)
+    /// - CL: ~24 LEDs per fan (outer + center)
+    pub fn leds_per_fan(self) -> u8 {
+        match self {
+            Self::Tlv2Lcd | Self::Tlv2Led => 26,
+            Self::Slv3Led | Self::Slv3Lcd => 40,
+            Self::SlInf => 44,
+            Self::Clv1 => 24,
+            Self::Unknown => 20,
         }
     }
 
@@ -635,6 +653,144 @@ impl WirelessController {
         };
 
         self.set_fan_speeds_by_mac(&mac, fan_pwm)
+    }
+
+    /// Send per-LED RGB colors to a wireless device via RF.
+    ///
+    /// This is the core function for wireless LED control. All effects are
+    /// host-rendered — the fan firmware just displays the received frames.
+    ///
+    /// ## Protocol (from L-Connect 3 MasterDevice.cs SetLightEffect):
+    ///
+    /// 1. Raw RGB data (`colors`) is compressed using tinyuz (4KB dict).
+    /// 2. Compressed data is split into 220-byte chunks.
+    /// 3. Header packet (index=0) carries metadata, sent 4× for reliability.
+    /// 4. Data packets (index=1..N) carry 220 bytes of compressed data each.
+    /// 5. Each 240-byte RF packet is sent as 4× 64-byte USB packets.
+    pub fn send_rgb_direct(
+        &self,
+        mac: &[u8; 6],
+        colors: &[[u8; 3]],
+        effect_index: &[u8; 4],
+    ) -> Result<()> {
+        let tx = self.tx.as_ref().context("TX device not connected")?;
+
+        let device = self
+            .discovered_devices
+            .lock()
+            .iter()
+            .find(|d| &d.mac == mac)
+            .cloned()
+            .context("device not found for RGB send")?;
+
+        let master_mac = *self.master_mac.lock();
+
+        // Flatten RGB triplets into a raw byte array
+        let mut rgb_data = Vec::with_capacity(colors.len() * 3);
+        for color in colors {
+            rgb_data.extend_from_slice(color);
+        }
+
+        // Compress with tinyuz
+        let compressed = crate::tinyuz::compress(&rgb_data)
+            .context("failed to compress RGB data")?;
+
+        const LZO_RF_VALID_LEN: usize = 220;
+        let total_pk_num =
+            (compressed.len() as f64 / LZO_RF_VALID_LEN as f64).ceil() as u8;
+
+        let led_num = colors.len() as u8;
+        let total_frame: u16 = 1; // Single frame for direct color mode
+
+        let mut offset: usize = 0;
+        let mut index: u8 = 0;
+
+        while offset < compressed.len() || index == 0 {
+            let mut rf_data = vec![0u8; RF_DATA_SIZE];
+
+            // Common header for all packets
+            rf_data[0] = RF_SELECT;
+            rf_data[1] = RF_SET_RGB;
+            rf_data[2..8].copy_from_slice(&device.mac);
+            rf_data[8..14].copy_from_slice(&master_mac);
+            rf_data[14..18].copy_from_slice(effect_index);
+            rf_data[18] = index;
+            rf_data[19] = total_pk_num + 1;
+
+            if index == 0 {
+                // Header packet: metadata only, no compressed data
+                let data_len = compressed.len() as u32;
+                rf_data[20] = (data_len >> 24) as u8;
+                rf_data[21] = ((data_len >> 16) & 0xFF) as u8;
+                rf_data[22] = ((data_len >> 8) & 0xFF) as u8;
+                rf_data[23] = (data_len & 0xFF) as u8;
+                rf_data[24] = 0; // Frame count high byte (always 0 for single frame)
+                rf_data[25] = (total_frame >> 8) as u8;
+                rf_data[26] = (total_frame & 0xFF) as u8;
+                rf_data[27] = led_num;
+                // Bytes 28-31: reserved/timing
+                // Bytes 32-33: interval (0 for direct mode)
+                // Bytes 34-39: sub-interval / flags
+
+                // Send header packet 4 times for reliability (L-Connect 3 convention)
+                let handle = tx.lock();
+                for repeat in 0..4u8 {
+                    self.send_rf_packet(&handle, &device, &rf_data)?;
+                    if repeat < 3 {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                drop(handle);
+            } else {
+                // Data packet: 220 bytes of compressed data at offset 20
+                let remaining = compressed.len() - offset;
+                let chunk_len = remaining.min(LZO_RF_VALID_LEN);
+                rf_data[20..20 + chunk_len]
+                    .copy_from_slice(&compressed[offset..offset + chunk_len]);
+                offset += LZO_RF_VALID_LEN;
+
+                let handle = tx.lock();
+                self.send_rf_packet(&handle, &device, &rf_data)?;
+                drop(handle);
+            }
+
+            index += 1;
+        }
+
+        debug!(
+            "Sent RGB frame to {} ({} LEDs, {} compressed bytes, {} packets)",
+            device.mac_str(),
+            led_num,
+            compressed.len(),
+            index
+        );
+        Ok(())
+    }
+
+    /// Send a 240-byte RF packet as 4× 64-byte USB chunks.
+    fn send_rf_packet(
+        &self,
+        handle: &UsbTransport,
+        device: &DiscoveredDevice,
+        rf_data: &[u8],
+    ) -> Result<()> {
+        for chunk_idx in 0..RF_CHUNKS as u8 {
+            let mut packet = vec![0u8; 64];
+            packet[0] = USB_CMD_SEND_RF;
+            packet[1] = chunk_idx;
+            packet[2] = device.channel;
+            packet[3] = device.rx_type;
+
+            let start = chunk_idx as usize * RF_CHUNK_SIZE;
+            let end = start + RF_CHUNK_SIZE;
+            packet[4..64].copy_from_slice(&rf_data[start..end]);
+
+            handle
+                .write_bulk(&packet, USB_TIMEOUT)
+                .context("sending RGB RF packet")?;
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) {

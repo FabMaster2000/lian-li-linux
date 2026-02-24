@@ -13,4 +13,5 @@ pub mod tl_lcd;
 pub mod traits;
 pub mod universal_screen;
 pub mod winusb_lcd;
+pub mod tinyuz;
 pub mod wireless;
