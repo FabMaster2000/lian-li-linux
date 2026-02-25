@@ -6,7 +6,7 @@
 
 <p align="center">
   Open-source Linux replacement for L-Connect 3.<br>
-  Fan speed control, LCD streaming, and sensor gauges for all Lian Li devices.
+  Fan speed control, RGB/LED effects, LCD streaming, and sensor gauges for all Lian Li devices.
 </p>
 
 ---
@@ -15,26 +15,26 @@
 
 ### Wired (HID)
 
-| Device | Fan Control | LCD | Pump |
-|--------|:-----------:|:---:|:----:|
-| UNI FAN SL / AL / SL Infinity / SL V2 / AL V2 (ENE 6K77) | 4 groups | - | - |
-| UNI FAN TL Controller | 4 ports | - | - |
-| UNI FAN TL LCD | 4 ports | 400x400 | - |
-| Galahad II Trinity AIO | Yes | - | Yes |
-| HydroShift LCD AIO | Yes | 480x480 | Yes |
-| Galahad II LCD / Vision AIO | Yes | 480x480 | Yes |
+| Device | Fan Control | RGB | LCD | Pump |
+|--------|:-----------:|:---:|:---:|:----:|
+| UNI FAN SL / AL / SL Infinity / SL V2 / AL V2 (ENE 6K77) | 4 groups | Yes | - | - |
+| UNI FAN TL Controller | 4 ports | Yes | - | - |
+| UNI FAN TL LCD | 4 ports | Yes | 400x400 | - |
+| Galahad II Trinity AIO | Yes | Yes | - | Yes |
+| HydroShift LCD AIO | Yes | - | 480x480 | Yes |
+| Galahad II LCD / Vision AIO | Yes | - | 480x480 | Yes |
 
 ### Wireless (USB Bulk via TX/RX dongle)
 
-| Device | LCD | Notes |
-|--------|:---:|-------|
-| UNI FAN SL V3 (LCD / LED) | 480x480 | 120mm / 140mm |
-| UNI FAN TL V2 (LCD / LED) | 480x480 | 120mm / 140mm |
-| UNI FAN SL-INF | - | Wireless |
-| UNI FAN CL / RL120 | - | Wireless |
-| HydroShift II LCD Circle | 480x480 | WinUSB |
-| Lancool 207 Digital | 1472x720 | WinUSB |
-| Universal Screen 8.8" | 1920x480 | WinUSB |
+| Device | RGB | LCD | Notes |
+|--------|:---:|:---:|-------|
+| UNI FAN SL V3 (LCD / LED) | Yes | 480x480 | 120mm / 140mm |
+| UNI FAN TL V2 (LCD / LED) | Yes | 480x480 | 120mm / 140mm |
+| UNI FAN SL-INF | Yes | - | Wireless |
+| UNI FAN CL / RL120 | Yes | - | Wireless |
+| HydroShift II LCD Circle | - | 480x480 | WinUSB |
+| Lancool 207 Digital | - | 1472x720 | WinUSB |
+| Universal Screen 8.8" | - | 1920x480 | WinUSB |
 
 ## Architecture
 
@@ -55,22 +55,30 @@ The GUI connects over `$XDG_RUNTIME_DIR/lianli-daemon.sock`.
 
 - **Rust** (stable, 1.75+)
 - **Bun** (for the GUI frontend)
+- **ffmpeg** and **ffprobe** in `PATH` (for video/GIF decoding)
 - **System libraries:**
 
 ```bash
 # Arch
-sudo pacman -S hidapi libusb webkit2gtk gtk3 librsvg
+sudo pacman -S hidapi libusb webkit2gtk gtk3 librsvg ffmpeg
 
 # Ubuntu / Debian
-sudo apt install libhidapi-dev libusb-1.0-0-dev libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+sudo apt install libhidapi-dev libusb-1.0-0-dev libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev ffmpeg
 
 # Fedora
-sudo dnf install hidapi-devel libusb1-devel webkit2gtk4.1-devel gtk3-devel librsvg2-devel
+sudo dnf install hidapi-devel libusb1-devel webkit2gtk4.1-devel gtk3-devel librsvg2-devel ffmpeg
 ```
 
 ## Building
 
 ```bash
+git clone --recurse-submodules https://github.com/sgtaziz/LIAN-LI-LINUX.git
+cd LIAN-LI-LINUX
+
+# If you already cloned without --recurse-submodules:
+git submodule update --init --recursive
+
+# Install GUI frontend dependencies and build everything
 cd crates/lianli-gui && bun install && cd ../..
 cargo build --release
 ```
