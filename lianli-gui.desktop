@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Lian Li Linux
 Comment=Fan control, LCD streaming, and sensor gauges for Lian Li devices
-Exec=sh -c 'GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 exec "$HOME/.local/bin/lianli-gui"'
+Exec=sh -c 'GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 exec "$HOME/.local/bin/lianli-gui"'
 Icon=lianli-gui
 Terminal=false
 Type=Application
