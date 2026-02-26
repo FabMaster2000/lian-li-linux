@@ -148,8 +148,25 @@ fn fan_control_thread(
         last_update = now;
 
         for (group_idx, group) in config.speeds.iter().enumerate() {
-            // Skip groups in MB RPM sync mode — hardware handles it
+            // MB RPM sync mode: wired hardware handles it natively, but wireless
+            // devices need software relay of the motherboard PWM signal.
             if group.speeds.iter().any(|s| s.is_mb_sync()) {
+                if let Some(ref device_id) = group.device_id {
+                    if device_id.starts_with("wireless:") {
+                        if let Some(ref w) = wireless {
+                            let mac_str = device_id.strip_prefix("wireless:").unwrap_or(device_id);
+                            if let Some(dev) = w.devices().into_iter().find(|d| d.mac_str() == mac_str) {
+                                if dev.fan_type.supports_hw_mobo_sync() {
+                                    // SLV3: firmware reads its local PWM header
+                                    apply_wireless_by_id(&wireless, device_id, &[6, 6, 6, 6], group_idx);
+                                } else if let Some(pwm) = w.motherboard_pwm() {
+                                    // RX dongle reports valid mobo PWM — relay it
+                                    apply_wireless_by_id(&wireless, device_id, &[pwm, pwm, pwm, pwm], group_idx);
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 

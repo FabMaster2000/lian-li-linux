@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::fmt;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU16, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -119,6 +119,15 @@ impl WirelessFanType {
             Self::Clv1 => 24,
             Self::Unknown => 20,
         }
+    }
+
+    /// Whether the receiver firmware supports direct motherboard PWM sync.
+    ///
+    /// SLV3 receivers have a physical PWM header — sending PWM=[6,6,6,6]
+    /// tells the firmware to read from that header instead. Other devices
+    /// (TLV2, SL-INF, CL) need the host to poll and relay mobo PWM.
+    pub fn supports_hw_mobo_sync(self) -> bool {
+        matches!(self, Self::Slv3Led | Self::Slv3Lcd)
     }
 
     /// Classify fan type from the fan-type byte in the device record.
@@ -297,6 +306,9 @@ pub struct WirelessController {
     master_mac: Arc<Mutex<[u8; 6]>>,
     master_channel: Arc<Mutex<u8>>,
     discovered_devices: Arc<Mutex<Vec<DiscoveredDevice>>>,
+    /// Motherboard PWM duty cycle (0-255) extracted from RX GetDev response bytes [2:3].
+    /// 0xFFFF means unavailable/not yet read.
+    mobo_pwm: Arc<AtomicU16>,
 }
 
 impl Clone for WirelessController {
@@ -310,6 +322,7 @@ impl Clone for WirelessController {
             master_mac: Arc::clone(&self.master_mac),
             master_channel: Arc::clone(&self.master_channel),
             discovered_devices: Arc::clone(&self.discovered_devices),
+            mobo_pwm: Arc::clone(&self.mobo_pwm),
         }
     }
 }
@@ -325,6 +338,7 @@ impl WirelessController {
             master_mac: Arc::new(Mutex::new([0u8; 6])),
             master_channel: Arc::new(Mutex::new(8)),
             discovered_devices: Arc::new(Mutex::new(Vec::new())),
+            mobo_pwm: Arc::new(AtomicU16::new(0xFFFF)),
         }
     }
 
@@ -452,11 +466,12 @@ impl WirelessController {
 
         let stop_flag = self.poll_stop.clone();
         let discovered_devices = Arc::clone(&self.discovered_devices);
+        let mobo_pwm = Arc::clone(&self.mobo_pwm);
 
         self.poll_thread = Some(thread::spawn(move || {
             let mut found_devices = false;
             while !stop_flag.load(Ordering::SeqCst) {
-                if let Err(err) = poll_and_discover(&rx, &discovered_devices) {
+                if let Err(err) = poll_and_discover(&rx, &discovered_devices, &mobo_pwm) {
                     warn!("RX polling error: {err:?}");
                     break;
                 }
@@ -579,6 +594,18 @@ impl WirelessController {
             .iter()
             .find(|d| &d.mac == mac)
             .cloned()
+    }
+
+    /// Get the current motherboard PWM duty cycle (0-255), or None if unavailable.
+    ///
+    /// Extracted from the RX GetDev response bytes [2:3] during polling.
+    /// Returns None if the high bit of byte[2] is set (mobo PWM not available)
+    /// or if no polling data has been received yet.
+    pub fn motherboard_pwm(&self) -> Option<u8> {
+        match self.mobo_pwm.load(Ordering::Relaxed) {
+            0xFFFF => None,
+            v => Some(v as u8),
+        }
     }
 
     /// Set fan PWM values for a specific device identified by MAC address.
@@ -907,6 +934,7 @@ fn apply_pwm_constraints(pwm: &mut [u8; 4], device: &DiscoveredDevice) {
 fn poll_and_discover(
     rx: &Arc<Mutex<UsbTransport>>,
     discovered_devices: &Arc<Mutex<Vec<DiscoveredDevice>>>,
+    mobo_pwm: &Arc<AtomicU16>,
 ) -> Result<()> {
     // GetDev command: [0x10, page_number, ...pad...]
     let mut cmd = vec![0u8; 64];
@@ -918,7 +946,7 @@ fn poll_and_discover(
         .write_bulk(&cmd, USB_TIMEOUT)
         .context("sending GetDev command")?;
 
-    // Response: [0]=0x10, [1]=device_count, [2-3]=ver/sync, [4+]=42-byte records
+    // Response: [0]=0x10, [1]=device_count, [2-3]=mobo_pwm or version, [4+]=42-byte records
     let mut response = [0u8; 512];
     match handle.read_bulk(&mut response, Duration::from_millis(200)) {
         Ok(len) if len >= 4 => {
@@ -928,6 +956,27 @@ fn poll_and_discover(
             }
 
             let device_count = response[1] as usize;
+
+            // Extract motherboard PWM from response bytes [2:3].
+            // Byte [2] high bit = unavailable flag. When clear:
+            //   off_time = byte[2] & 0x7F, on_time = byte[3]
+            //   pwm = 255 * on_time / (on_time + off_time)
+            let indicator = response[2];
+            if indicator >> 7 == 1 {
+                // High bit set — mobo PWM unavailable (bytes are firmware version instead)
+                mobo_pwm.store(0xFFFF, Ordering::Relaxed);
+            } else {
+                let off_time = (indicator & 0x7F) as u16;
+                let on_time = response[3] as u16;
+                let denominator = off_time + on_time;
+                if denominator > 0 {
+                    let pwm = (255u16 * on_time / denominator).min(255);
+                    mobo_pwm.store(pwm, Ordering::Relaxed);
+                } else {
+                    mobo_pwm.store(0xFFFF, Ordering::Relaxed);
+                }
+            }
+
             debug!("GetDev: {device_count} device(s) reported");
 
             if device_count == 0 || device_count > 12 {

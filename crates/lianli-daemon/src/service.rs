@@ -296,7 +296,7 @@ impl ServiceManager {
             devices.push(DeviceInfo {
                 device_id: format!("wireless:{}", dev.mac_str()),
                 family,
-                name: format!("{:?}", dev.fan_type),
+                name: dev.fan_type.display_name().to_string(),
                 serial: Some(dev.mac_str()),
                 has_lcd: false, // LCD streaming uses USB bulk, not wireless
                 has_fan: dev.fan_count > 0,
@@ -304,7 +304,7 @@ impl ServiceManager {
                 has_rgb: true, // All wireless fans have RGB LEDs
                 fan_count: Some(dev.fan_count),
                 per_fan_control: Some(true),
-                mb_sync_support: false, // wireless fans don't support hardware MB sync
+                mb_sync_support: dev.fan_type.supports_hw_mobo_sync() || self.wireless.motherboard_pwm().is_some(),
                 rgb_zone_count: Some(dev.fan_count), // One zone per fan
                 screen_width: None,
                 screen_height: None,
