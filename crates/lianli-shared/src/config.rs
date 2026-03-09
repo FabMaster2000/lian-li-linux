@@ -112,7 +112,9 @@ fn default_fps() -> f32 {
 }
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Load and validate config. Returns the config and a list of non-fatal warnings
+    /// (e.g. invalid LCD entries that were skipped).
+    pub fn load(path: &Path) -> Result<(Self, Vec<String>)> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let reader = BufReader::new(file);
         let mut cfg: AppConfig = serde_json::from_reader(reader)
@@ -123,18 +125,21 @@ impl AppConfig {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
+        let mut warnings = Vec::new();
         let mut seen = HashSet::new();
-        for device in &mut cfg.lcds {
+        cfg.lcds.retain_mut(|device| {
             let identifier = if let Some(serial) = &device.serial {
                 format!("serial:{serial}")
             } else if let Some(index) = device.index {
                 format!("index:{index}")
             } else {
-                continue;
+                warnings.push("Skipping LCD entry: missing both 'index' and 'serial'".to_string());
+                return false;
             };
 
             if !seen.insert(identifier.clone()) {
-                bail!("duplicate device identifier '{identifier}' in configuration");
+                warnings.push(format!("Skipping duplicate LCD entry '{identifier}'"));
+                return false;
             }
 
             if let Some(existing) = &device.path {
@@ -151,8 +156,14 @@ impl AppConfig {
                 }
             }
 
-            device.validate()?;
-        }
+            match device.validate() {
+                Ok(()) => true,
+                Err(e) => {
+                    warnings.push(format!("Skipping LCD entry: {e}"));
+                    false
+                }
+            }
+        });
 
         if cfg.default_fps <= 0.0 {
             bail!("default_fps must be greater than zero");
@@ -165,7 +176,7 @@ impl AppConfig {
             device.orientation = snapped % 360.0;
         }
 
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 }
 

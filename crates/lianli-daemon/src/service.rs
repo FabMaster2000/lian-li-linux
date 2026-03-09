@@ -643,7 +643,10 @@ impl ServiceManager {
 
     fn load_config(&mut self) -> bool {
         match AppConfig::load(&self.config_path) {
-            Ok(cfg) => {
+            Ok((cfg, warnings)) => {
+                for w in &warnings {
+                    warn!("Config: {w}");
+                }
                 self.config = Some(cfg);
                 self.packet_builder = PacketBuilder::new();
                 self.prepare_media_assets();
