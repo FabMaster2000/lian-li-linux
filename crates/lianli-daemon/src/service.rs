@@ -193,7 +193,8 @@ impl ServiceManager {
             Ok(usb_devices) => {
                 let mut cached = Vec::new();
                 for det in usb_devices {
-                    // Skip wireless dongles and fan-only devices (handled separately)
+                    // Skip wireless dongles, fan-only devices (handled separately),
+                    // and HID LCD devices (added below via hidapi with proper serials).
                     if matches!(
                         det.family,
                         lianli_shared::device_id::DeviceFamily::WirelessTx
@@ -201,6 +202,8 @@ impl ServiceManager {
                             | lianli_shared::device_id::DeviceFamily::DisplaySwitcher
                             | lianli_shared::device_id::DeviceFamily::TlFan
                             | lianli_shared::device_id::DeviceFamily::Ene6k77
+                            | lianli_shared::device_id::DeviceFamily::HydroShiftLcd
+                            | lianli_shared::device_id::DeviceFamily::Galahad2Lcd
                     ) {
                         continue;
                     }
@@ -226,6 +229,33 @@ impl ServiceManager {
                         screen_height: screen.map(|s| s.height),
                     });
                 }
+                // Add HID LCD devices with proper serials from hidapi
+                if let Ok(api) = hidapi::HidApi::new() {
+                    for det in enumerate_hid_devices(&api) {
+                        if !det.family.has_lcd() || !lianli_shared::device_id::uses_hid(det.family) {
+                            continue;
+                        }
+                        let screen = screen_info_for(det.family);
+                        let device_id = det.device_id();
+                        cached.push(DeviceInfo {
+                            device_id,
+                            family: det.family,
+                            name: det.name.to_string(),
+                            serial: det.serial,
+                            has_lcd: true,
+                            has_fan: det.family.has_fan(),
+                            has_pump: det.family.has_pump(),
+                            has_rgb: det.family.has_rgb(),
+                            fan_count: None,
+                            per_fan_control: None,
+                            mb_sync_support: false,
+                            rgb_zone_count: None,
+                            screen_width: screen.map(|s| s.width),
+                            screen_height: screen.map(|s| s.height),
+                        });
+                    }
+                }
+
                 self.cached_usb_devices = cached;
             }
             Err(e) => {
