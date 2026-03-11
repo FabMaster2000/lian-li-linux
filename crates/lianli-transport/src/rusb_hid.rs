@@ -65,6 +65,17 @@ impl RusbHidTransport {
         })
     }
 
+    /// Perform a USB port reset on the device (USBDEVFS_RESET ioctl).
+    /// This resets the device firmware state, which can fix malformed HID
+    /// report descriptors on devices that persist bad state across reboots.
+    pub fn reset_usb_device(device: &Device<GlobalContext>) -> Result<(), TransportError> {
+        let handle = device.open()?;
+        handle.reset().map_err(|e| {
+            TransportError::Other(format!("USB device reset failed: {e}"))
+        })?;
+        Ok(())
+    }
+
     pub fn find_hid_interface(device: &Device<GlobalContext>) -> Option<u8> {
         let config = device.active_config_descriptor().ok()?;
         for iface in config.interfaces() {

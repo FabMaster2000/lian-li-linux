@@ -1,8 +1,5 @@
-//! Quick test: enumerate HID devices, try hidapi open, then rusb detach + retry.
-//! Run with: cargo +nightly -Zscript test_hid_attach.rs
-//! Or compile: rustc test_hid_attach.rs -o test_hid_attach (won't work, needs deps)
-//!
-//! Instead, just: cargo run --example test_hid_attach -p lianli-devices
+//! Quick test: enumerate HID devices, try USB reset, hidapi open, rusb transport.
+//! Run with: cargo run --example test_hid_attach -p lianli-devices
 
 fn main() {
     println!("=== HID Attach Test ===\n");
@@ -26,7 +23,6 @@ fn main() {
 
         for iface in config.interfaces() {
             for iface_desc in iface.descriptors() {
-                // HID class = 0x03
                 if iface_desc.class_code() == 0x03 {
                     let iface_num = iface_desc.interface_number();
                     let name = match device.open() {
@@ -69,8 +65,29 @@ fn main() {
     let iface_num = *iface_num;
     println!("\n--- Testing with: {name} ({vid:04x}:{pid:04x}) interface={iface_num} ---\n");
 
-    // Step 2: Try hidapi::open(vid, pid)
-    println!("[1] Trying hidapi::open({vid:04x}, {pid:04x})...");
+    // Step 0: USB device reset (fixes devices with malformed HID descriptors)
+    println!("[0] Trying USB device reset (USBDEVFS_RESET)...");
+    let find_usb_device = || {
+        rusb::devices().ok()?.iter().find(|d| {
+            d.device_descriptor()
+                .map(|desc| desc.vendor_id() == vid && desc.product_id() == pid)
+                .unwrap_or(false)
+        })
+    };
+    if let Some(usb_dev) = find_usb_device() {
+        match lianli_transport::RusbHidTransport::reset_usb_device(&usb_dev) {
+            Ok(()) => {
+                println!("    USB reset successful. Waiting 3 seconds for re-enumeration...");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+            Err(e) => println!("    USB reset failed: {e}"),
+        }
+    } else {
+        println!("    Could not find device via rusb");
+    }
+
+    // Step 1: Try hidapi::open(vid, pid)
+    println!("\n[1] Trying hidapi::open({vid:04x}, {pid:04x})...");
     match hidapi::HidApi::new() {
         Ok(api) => match api.open(vid, pid) {
             Ok(dev) => {
@@ -90,18 +107,9 @@ fn main() {
         Err(e) => println!("    FAILED to init hidapi: {e}"),
     }
 
-    // Step 3: Try rusb detach kernel driver, then hidapi::open
+    // Step 2: Try rusb detach kernel driver, then hidapi::open
     println!("\n[2] Trying rusb detach kernel driver, then hidapi::open...");
-    let rusb_device = rusb::devices()
-        .unwrap()
-        .iter()
-        .find(|d| {
-            d.device_descriptor()
-                .map(|desc| desc.vendor_id() == vid && desc.product_id() == pid)
-                .unwrap_or(false)
-        });
-
-    if let Some(usb_dev) = rusb_device {
+    if let Some(usb_dev) = find_usb_device() {
         match usb_dev.open() {
             Ok(handle) => {
                 match handle.kernel_driver_active(iface_num) {
@@ -111,7 +119,6 @@ fn main() {
                             Ok(()) => {
                                 println!("    Detached kernel driver successfully");
 
-                                // Now try hidapi again
                                 println!("    Retrying hidapi::open({vid:04x}, {pid:04x})...");
                                 match hidapi::HidApi::new() {
                                     Ok(api) => match api.open(vid, pid) {
@@ -119,12 +126,11 @@ fn main() {
                                             println!("    SUCCESS: hidapi opened after detach!");
                                             drop(dev);
                                         }
-                                        Err(e) => println!("    STILL FAILED: {e}"),
+                                        Err(e) => println!("    FAILED: {e}"),
                                     },
                                     Err(e) => println!("    hidapi init failed: {e}"),
                                 }
 
-                                // Re-attach kernel driver
                                 let _ = handle.attach_kernel_driver(iface_num);
                                 println!("    Re-attached kernel driver");
                             }
@@ -147,13 +153,9 @@ fn main() {
         println!("    Could not find device via rusb");
     }
 
-    // Step 4: Try RusbHidTransport (our actual transport layer)
+    // Step 3: Try RusbHidTransport (our actual transport layer)
     println!("\n[3] Trying RusbHidTransport::open...");
-    if let Some(usb_dev) = rusb::devices().unwrap().iter().find(|d| {
-        d.device_descriptor()
-            .map(|desc| desc.vendor_id() == vid && desc.product_id() == pid)
-            .unwrap_or(false)
-    }) {
+    if let Some(usb_dev) = find_usb_device() {
         let iface = lianli_transport::RusbHidTransport::find_hid_interface(&usb_dev)
             .unwrap_or(iface_num);
         println!("    Found HID interface: {iface}");
@@ -162,7 +164,6 @@ fn main() {
             Ok(transport) => {
                 println!("    SUCCESS: RusbHidTransport opened");
 
-                // Try a write + read round-trip (64-byte HID report)
                 println!("    Trying write + read...");
                 let mut pkt = [0u8; 64];
                 pkt[0] = 0x01; // Report ID
