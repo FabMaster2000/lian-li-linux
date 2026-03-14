@@ -1,6 +1,10 @@
 /target/
 node_modules/
 dist/
+artifacts/
+*.log
+*.pid
+*.sock
 *.swp
 *.swo
 *~

@@ -1,0 +1,14 @@
+[Unit]
+Description=Lian Li Web Backend
+After=lianli-daemon.service
+Requires=lianli-daemon.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lianli-backend
+Restart=on-failure
+RestartSec=5
+Environment=LIANLI_BACKEND_CONFIG=%h/.config/lianli/backend.json
+
+[Install]
+WantedBy=default.target

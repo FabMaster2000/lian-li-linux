@@ -21,3 +21,6 @@ parking_lot = { workspace = true }
 rusb = { workspace = true }
 hidapi = { workspace = true }
 notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

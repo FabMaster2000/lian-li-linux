@@ -1,0 +1,28 @@
+[package]
+name = "lianli-backend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lianli-backend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+axum = { version = "0.6", features = ["ws"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+lianli-shared = { path = "../crates/lianli-shared" }
+time = { version = "0.3", features = ["formatting"] }
+base64 = "0.22"
+
+[dev-dependencies]
+hyper = "0.14"
+tempfile = { workspace = true }
+tokio-tungstenite = "0.21"
+tower = { version = "0.4", features = ["util"] }

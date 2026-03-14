@@ -1,0 +1,40 @@
+export type LightingEffectOption = {
+  value: string;
+  label: string;
+};
+
+export const lightingEffectOptions: LightingEffectOption[] = [
+  { value: "Off", label: "Off" },
+  { value: "Static", label: "Static" },
+  { value: "Rainbow", label: "Rainbow" },
+  { value: "RainbowMorph", label: "Rainbow Morph" },
+  { value: "Breathing", label: "Breathing" },
+  { value: "Runway", label: "Runway" },
+  { value: "Meteor", label: "Meteor" },
+  { value: "ColorCycle", label: "Color Cycle" },
+  { value: "Staggered", label: "Staggered" },
+  { value: "Tide", label: "Tide" },
+  { value: "Mixing", label: "Mixing" },
+  { value: "Voice", label: "Voice" },
+  { value: "Door", label: "Door" },
+  { value: "Render", label: "Render" },
+  { value: "Ripple", label: "Ripple" },
+  { value: "Reflect", label: "Reflect" },
+  { value: "TailChasing", label: "Tail Chasing" },
+  { value: "Paint", label: "Paint" },
+  { value: "PingPong", label: "Ping Pong" },
+  { value: "Stack", label: "Stack" },
+  { value: "CoverCycle", label: "Cover Cycle" },
+  { value: "Wave", label: "Wave" },
+  { value: "Racing", label: "Racing" },
+  { value: "Lottery", label: "Lottery" },
+  { value: "Intertwine", label: "Intertwine" },
+  { value: "MeteorShower", label: "Meteor Shower" },
+  { value: "Collide", label: "Collide" },
+  { value: "ElectricCurrent", label: "Electric Current" },
+  { value: "Kaleidoscope", label: "Kaleidoscope" },
+  { value: "BigBang", label: "Big Bang" },
+  { value: "Vortex", label: "Vortex" },
+  { value: "Pump", label: "Pump" },
+  { value: "ColorsMorph", label: "Colors Morph" },
+];

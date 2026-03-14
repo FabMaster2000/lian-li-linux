@@ -338,3 +338,121 @@ fn write_response(writer: &mut impl Write, response: &IpcResponse) -> anyhow::Re
     writer.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_request, write_config, DaemonState};
+    use lianli_shared::config::{AppConfig, LcdConfig};
+    use lianli_shared::ipc::{IpcRequest, IpcResponse};
+    use lianli_shared::media::MediaType;
+    use parking_lot::Mutex;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn ping_request_returns_pong() {
+        let state = Arc::new(Mutex::new(DaemonState::new(PathBuf::from(
+            "/tmp/lianli-tests/config.json",
+        ))));
+
+        let response = handle_request(IpcRequest::Ping, &state);
+
+        match response {
+            IpcResponse::Ok { data } => assert_eq!(data, serde_json::json!("pong")),
+            other => panic!("expected ok response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_config_without_loaded_state_returns_error() {
+        let state = Arc::new(Mutex::new(DaemonState::new(PathBuf::from(
+            "/tmp/lianli-tests/config.json",
+        ))));
+
+        let response = handle_request(IpcRequest::GetConfig, &state);
+
+        match response {
+            IpcResponse::Error { message } => assert!(message.contains("config not loaded yet")),
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_request_returns_not_implemented_error() {
+        let state = Arc::new(Mutex::new(DaemonState::new(PathBuf::from(
+            "/tmp/lianli-tests/config.json",
+        ))));
+
+        let response = handle_request(IpcRequest::Subscribe, &state);
+
+        match response {
+            IpcResponse::Error { message } => {
+                assert_eq!(
+                    message,
+                    "Subscribe not yet implemented; use polling via GetTelemetry"
+                )
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_config_persists_file_and_marks_reload_pending() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let config_path = tempdir.path().join("nested").join("config.json");
+        let state = Arc::new(Mutex::new(DaemonState::new(config_path.clone())));
+        let config = sample_config();
+
+        let response = handle_request(
+            IpcRequest::SetConfig {
+                config: config.clone(),
+            },
+            &state,
+        );
+
+        match response {
+            IpcResponse::Ok { .. } => {}
+            other => panic!("expected ok response, got {other:?}"),
+        }
+
+        let guard = state.lock();
+        assert!(guard.config_reload_pending);
+        assert!(guard.config.is_some());
+        drop(guard);
+
+        let (written, warnings) = AppConfig::load(&config_path).expect("load written config");
+        assert!(warnings.is_empty());
+        assert_eq!(written.default_fps, config.default_fps);
+        assert_eq!(written.lcds[0].device_id(), "serial:LCD123");
+    }
+
+    #[test]
+    fn write_config_creates_parent_directories() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let config_path = tempdir.path().join("deep").join("path").join("config.json");
+
+        write_config(&config_path, &sample_config()).expect("write config");
+
+        assert!(config_path.exists());
+    }
+
+    fn sample_config() -> AppConfig {
+        AppConfig {
+            default_fps: 30.0,
+            hid_driver: Default::default(),
+            lcds: vec![LcdConfig {
+                index: None,
+                serial: Some("LCD123".to_string()),
+                media_type: MediaType::Color,
+                path: None,
+                fps: Some(12.0),
+                rgb: Some([1, 2, 3]),
+                orientation: 0.0,
+                sensor: None,
+            }],
+            fan_curves: Vec::new(),
+            fans: None,
+            rgb: None,
+        }
+    }
+}

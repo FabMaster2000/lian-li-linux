@@ -41,15 +41,39 @@
 ```
 lianli-daemon          User service - fan control loop + LCD streaming
   lianli-devices       HID/USB device drivers
-  lianli-transport     USB bulk transport (wireless protocol, display streaming)
-  lianli-media         Image/video/GIF encoding, sensor gauge rendering
+  lianli-transport     HID/USB backends and wireless transport
+  lianli-media         Image/video/GIF encoding and sensor rendering
   lianli-shared        IPC types, config schema, device IDs
 
 lianli-gui             Slint desktop app - connects to daemon via Unix socket
+lianli-cli             CLI helper - reuses the same daemon IPC contract
+lianli-backend         HTTP/WebSocket bridge for browser clients
+frontend/              React/Vite web UI for dashboard, lighting, fans, and profiles
 ```
 
 The daemon runs as a user systemd service. USB access is granted via udev rules (no root required).
 The GUI connects over `$XDG_RUNTIME_DIR/lianli-daemon.sock`.
+The backend talks to the same daemon socket and exposes `/api/*` plus `/api/ws` for the web UI.
+
+## Developer Documentation
+
+For developers extending the project, start here:
+
+- `docs/architecture.md` - overall system layout, runtime topology, request flows, and known limits
+- `docs/backend.md` - backend module overview, request handling, config/profile persistence, and extension points
+- `docs/frontend.md` - frontend structure, state model, event flow, and page/workbench conventions
+- `docs/api.md` - HTTP/WebSocket API contract
+- `docs/deployment.md` - production-style deployment, services, reverse proxy, and diagnostics
+
+Supporting docs for specific areas:
+
+- `docs/backend-config.md`
+- `docs/event-model.md`
+- `docs/future-extensions.md`
+- `docs/polling-fallback.md`
+- `docs/profile-model.md`
+- `docs/profile-storage.md`
+- `docs/container-tests.md`
 
 ## Building
 
@@ -161,6 +185,9 @@ update-desktop-database ~/.local/share/applications/
 ## Configuration
 
 The daemon reads `~/.config/lianli/config.json`. The GUI edits this file via the daemon's IPC socket.
+The web backend config file, auth modes, and environment overrides are documented in `docs/backend-config.md`.
+A production-style LAN deployment guide is documented in `docs/deployment.md`.
+Shipped systemd artifacts now include `systemd/lianli-daemon.service`, `systemd/lianli-backend.service`, and `systemd/lianli-stack.target`.
 
 ### LCD Streaming
 

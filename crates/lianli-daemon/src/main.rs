@@ -60,3 +60,59 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::default_config_path;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn default_config_path_prefers_xdg_config_home() {
+        let _guard = env_lock().lock().expect("lock env");
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let old_home = std::env::var("HOME").ok();
+
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/lianli-tests/xdg");
+        std::env::set_var("HOME", "/tmp/lianli-tests/home");
+
+        assert_eq!(
+            default_config_path(),
+            PathBuf::from("/tmp/lianli-tests/xdg/lianli/config.json")
+        );
+
+        restore_env("XDG_CONFIG_HOME", old_xdg);
+        restore_env("HOME", old_home);
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_home_config() {
+        let _guard = env_lock().lock().expect("lock env");
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let old_home = std::env::var("HOME").ok();
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", "/tmp/lianli-tests/home");
+
+        assert_eq!(
+            default_config_path(),
+            PathBuf::from("/tmp/lianli-tests/home/.config/lianli/config.json")
+        );
+
+        restore_env("XDG_CONFIG_HOME", old_xdg);
+        restore_env("HOME", old_home);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+}

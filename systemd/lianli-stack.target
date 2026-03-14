@@ -1,0 +1,7 @@
+[Unit]
+Description=Lian Li Daemon and Backend Stack
+Wants=lianli-daemon.service lianli-backend.service
+After=lianli-daemon.service lianli-backend.service
+
+[Install]
+WantedBy=default.target

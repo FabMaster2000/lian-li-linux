@@ -1,0 +1,19 @@
+:root {
+  --font-display: "Avenir Next", "Trebuchet MS", "Segoe UI", sans-serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --bg-base: #08131d;
+  --bg-elevated: rgba(12, 29, 42, 0.82);
+  --bg-panel: rgba(9, 22, 31, 0.72);
+  --line-soft: rgba(180, 218, 255, 0.16);
+  --text-strong: #f4f7fb;
+  --text-muted: #9db3c7;
+  --accent-copper: #ff8a3d;
+  --accent-teal: #4ad8bf;
+  --accent-ice: #8cb9ff;
+  --status-next: #ffd166;
+  --status-planned: #a0aec0;
+  --status-ready: #4ad8bf;
+  --shadow-panel: 0 30px 80px rgba(0, 0, 0, 0.28);
+  --radius-xl: 28px;
+  --radius-lg: 20px;
+}

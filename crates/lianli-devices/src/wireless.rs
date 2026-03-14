@@ -192,6 +192,96 @@ impl fmt::Display for DiscoveredDevice {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SimulatedWireless {
+    fan_type: WirelessFanType,
+    fan_type_byte: u8,
+    fan_count: u8,
+    mac: [u8; 6],
+    master_mac: [u8; 6],
+    channel: u8,
+    rx_type: u8,
+    mobo_pwm: Option<u8>,
+}
+
+impl SimulatedWireless {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("LIANLI_SIM_WIRELESS").ok()?;
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let mut parts = raw
+            .split(|c| c == ':' || c == ',' || c == ';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        let kind_raw = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let kind = kind_raw.replace('-', "").replace('_', "");
+
+        let fan_count = parts
+            .next()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(3)
+            .clamp(1, 4);
+
+        let (fan_type, fan_type_byte) = if kind.contains("slinf") {
+            // 36..=39 are SL-INF; default to 120mm (36). If "140" is present, use 37.
+            let byte = if kind.contains("140") { 37 } else { 36 };
+            (WirelessFanType::SlInf, byte)
+        } else {
+            warn!(
+                "LIANLI_SIM_WIRELESS='{raw}' not supported (expected slinf[:1-4])"
+            );
+            return None;
+        };
+
+        Some(Self {
+            fan_type,
+            fan_type_byte,
+            fan_count,
+            mac: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
+            master_mac: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            channel: 8,
+            rx_type: 1,
+            mobo_pwm: None,
+        })
+    }
+
+    fn build_device(&self) -> DiscoveredDevice {
+        let mut fan_types = [0u8; 4];
+        for slot in 0..self.fan_count.min(4) as usize {
+            fan_types[slot] = self.fan_type_byte;
+        }
+
+        DiscoveredDevice {
+            mac: self.mac,
+            master_mac: self.master_mac,
+            channel: self.channel,
+            rx_type: self.rx_type,
+            device_type: 0,
+            fan_count: self.fan_count,
+            fan_types,
+            fan_rpms: [0, 0, 0, 0],
+            current_pwm: [0, 0, 0, 0],
+            cmd_seq: 1,
+            fan_type: self.fan_type,
+            list_index: 0,
+        }
+    }
+
+    fn apply(&self, controller: &WirelessController) {
+        *controller.master_mac.lock() = self.master_mac;
+        *controller.master_channel.lock() = self.channel;
+        *controller.discovered_devices.lock() = vec![self.build_device()];
+        match self.mobo_pwm {
+            Some(v) => controller.mobo_pwm.store(v as u16, Ordering::Relaxed),
+            None => controller.mobo_pwm.store(0xFFFF, Ordering::Relaxed),
+        }
+    }
+}
+
 /// Parse a 42-byte device record from GetDev response.
 ///
 /// Record layout:
@@ -284,6 +374,7 @@ fn parse_device_record(data: &[u8], list_index: u8) -> Option<DiscoveredDevice> 
 pub struct WirelessController {
     tx: Option<Arc<Mutex<UsbTransport>>>,
     rx: Option<Arc<Mutex<UsbTransport>>>,
+    simulated: Option<SimulatedWireless>,
     poll_stop: Arc<AtomicBool>,
     poll_thread: Option<JoinHandle<()>>,
     video_mode_active: Arc<AtomicBool>,
@@ -300,6 +391,7 @@ impl Clone for WirelessController {
         Self {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
+            simulated: self.simulated.clone(),
             poll_stop: Arc::clone(&self.poll_stop),
             poll_thread: None,
             video_mode_active: Arc::clone(&self.video_mode_active),
@@ -313,9 +405,11 @@ impl Clone for WirelessController {
 
 impl WirelessController {
     pub fn new() -> Self {
-        Self {
+        let simulated = SimulatedWireless::from_env();
+        let controller = Self {
             tx: None,
             rx: None,
+            simulated,
             poll_stop: Arc::new(AtomicBool::new(false)),
             poll_thread: None,
             video_mode_active: Arc::new(AtomicBool::new(false)),
@@ -323,10 +417,31 @@ impl WirelessController {
             master_channel: Arc::new(Mutex::new(8)),
             discovered_devices: Arc::new(Mutex::new(Vec::new())),
             mobo_pwm: Arc::new(AtomicU16::new(0xFFFF)),
+        };
+
+        if let Some(sim) = controller.simulated.as_ref() {
+            sim.apply(&controller);
+            info!(
+                "Wireless simulation enabled: {} ({} fan(s))",
+                sim.fan_type.display_name(),
+                sim.fan_count
+            );
         }
+
+        controller
     }
 
     pub fn connect(&mut self) -> Result<()> {
+        if let Some(sim) = &self.simulated {
+            sim.apply(self);
+            info!(
+                "Wireless simulation active: {} ({} fan(s))",
+                sim.fan_type.display_name(),
+                sim.fan_count
+            );
+            return Ok(());
+        }
+
         let mut tx = None;
         let max_retries = 3;
 
@@ -427,6 +542,11 @@ impl WirelessController {
     }
 
     pub fn start_polling(&mut self) -> Result<()> {
+        if let Some(sim) = &self.simulated {
+            sim.apply(self);
+            return Ok(());
+        }
+
         let tx = self
             .tx
             .as_ref()
@@ -472,6 +592,10 @@ impl WirelessController {
     }
 
     pub fn ensure_video_mode(&self) -> Result<()> {
+        if self.simulated.is_some() {
+            return Ok(());
+        }
+
         if self.video_mode_active.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -507,6 +631,10 @@ impl WirelessController {
     }
 
     pub fn send_rx_sequence(&self) -> Result<()> {
+        if self.simulated.is_some() {
+            return Ok(());
+        }
+
         if let Some(rx) = &self.rx {
             for (cmd, capture) in [
                 (&*CMD_RX_QUERY_34, true),
@@ -533,6 +661,11 @@ impl WirelessController {
     }
 
     pub fn soft_reset(&mut self) -> bool {
+        if let Some(sim) = &self.simulated {
+            sim.apply(self);
+            return true;
+        }
+
         if self.tx.is_none() {
             if let Ok(mut transport) = UsbTransport::open(TX_VENDOR, TX_PRODUCT) {
                 if transport.detach_and_configure("TX").is_ok() {
@@ -610,6 +743,39 @@ impl WirelessController {
     /// [21-239]= Reserved
     /// ```
     pub fn set_fan_speeds_by_mac(&self, mac: &[u8; 6], fan_pwm: &[u8; 4]) -> Result<()> {
+        if self.simulated.is_some() {
+            let mut devices = self.discovered_devices.lock();
+            let device = devices
+                .iter_mut()
+                .find(|d| &d.mac == mac)
+                .context(format!(
+                    "Simulated device MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} not found",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                ))?;
+
+            let mut pwm = *fan_pwm;
+            apply_pwm_constraints(&mut pwm, device);
+            device.current_pwm = pwm;
+            device.cmd_seq = device.cmd_seq.wrapping_add(1);
+
+            let max_rpm: u16 = 2000;
+            for idx in 0..4 {
+                if idx as u8 >= device.fan_count {
+                    device.fan_rpms[idx] = 0;
+                    continue;
+                }
+                let rpm = (pwm[idx] as u32 * max_rpm as u32 / 255) as u16;
+                device.fan_rpms[idx] = rpm;
+            }
+
+            debug!(
+                "[sim] Set fan PWM for {}: {:?}",
+                device.mac_str(),
+                pwm
+            );
+            return Ok(());
+        }
+
         let tx = self.tx.as_ref().context("TX device not connected")?;
 
         let device = self.discovered_devices
@@ -695,6 +861,16 @@ impl WirelessController {
         effect_index: &[u8; 4],
         header_repeats: u8,
     ) -> Result<()> {
+        if self.simulated.is_some() {
+            debug!(
+                "[sim] RGB direct for {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} colors, effect={:02x?})",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                colors.len(),
+                effect_index
+            );
+            return Ok(());
+        }
+
         let led_num = colors.len() as u8;
         let mut raw_rgb = Vec::with_capacity(colors.len() * 3);
         for color in colors {
@@ -716,6 +892,17 @@ impl WirelessController {
         effect_index: &[u8; 4],
         header_repeats: u8,
     ) -> Result<()> {
+        if self.simulated.is_some() {
+            debug!(
+                "[sim] RGB frames for {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} frame(s), interval={}ms, effect={:02x?})",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                frames.len(),
+                interval_ms,
+                effect_index
+            );
+            return Ok(());
+        }
+
         if frames.is_empty() {
             return Ok(());
         }
@@ -747,6 +934,18 @@ impl WirelessController {
         effect_index: &[u8; 4],
         header_repeats: u8,
     ) -> Result<()> {
+        if self.simulated.is_some() {
+            debug!(
+                "[sim] RGB payload for {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} frames, {} LEDs, interval={}ms, effect={:02x?})",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                total_frames,
+                led_num,
+                interval_ms,
+                effect_index
+            );
+            return Ok(());
+        }
+
         let tx = self.tx.as_ref().context("TX device not connected")?;
 
         let device = self
