@@ -1,4 +1,8 @@
 import { useCallback, useEffect } from "react";
+import {
+  LIVE_STATUS_REFRESH_INTERVAL_MS,
+  useBackgroundRefresh,
+} from "./useBackgroundRefresh";
 import { useBackendEventSubscription } from "./useBackendEventSubscription";
 import type { DaemonStatusResponse, DeviceView, RuntimeResponse } from "../types/api";
 import { listDevices } from "../services/devices";
@@ -63,6 +67,13 @@ export function useDashboardData(): DashboardDataState {
       },
       [snapshot.refresh],
     ),
+  );
+
+  useBackgroundRefresh(
+    useCallback(async () => {
+      await snapshot.refresh({ background: true });
+    }, [snapshot.refresh]),
+    LIVE_STATUS_REFRESH_INTERVAL_MS,
   );
 
   return {

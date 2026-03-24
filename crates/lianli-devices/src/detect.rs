@@ -65,6 +65,10 @@ pub struct DetectedHidDevice {
 /// Known non-unique HID serial strings (chip manufacturer names, not device serials).
 const NON_UNIQUE_SERIALS: &[&str] = &["Nuvoton"];
 
+fn should_read_usb_serial(family: DeviceFamily) -> bool {
+    !matches!(family, DeviceFamily::WirelessTx | DeviceFamily::WirelessRx)
+}
+
 impl DetectedHidDevice {
     /// Stable device ID: serial if unique, otherwise USB port path.
     pub fn device_id(&self) -> String {
@@ -126,11 +130,17 @@ pub fn enumerate_devices() -> Result<Vec<DetectedDevice>> {
             let bus = device.bus_number();
             let address = device.address();
 
-            // Try to read serial number
-            let serial = device
-                .open()
-                .ok()
-                .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
+            // Skip serial reads for wireless dongles during periodic USB enumeration.
+            // Their stable IDs already fall back to the USB port path, and reopening the
+            // dongle every refresh can interfere with live wireless control.
+            let serial = if should_read_usb_serial(entry.family) {
+                device
+                    .open()
+                    .ok()
+                    .and_then(|h| h.read_serial_number_string_ascii(&desc).ok())
+            } else {
+                None
+            };
 
             debug!(
                 "Found {} ({:04x}:{:04x}) at bus {} addr {} serial={}",

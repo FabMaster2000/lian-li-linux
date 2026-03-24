@@ -101,4 +101,50 @@ describe("BackendEventsProvider", () => {
 
     expect(connectBackendEventsMock).toHaveBeenCalledTimes(2);
   });
+
+  it("backs off reconnect attempts and resets after a successful reconnect", () => {
+    render(
+      <BackendEventsProvider>
+        <Probe />
+      </BackendEventsProvider>,
+    );
+
+    act(() => {
+      handlers[0]?.onOpen?.();
+      handlers[0]?.onClose?.({} as CloseEvent);
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(999);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      handlers[1]?.onClose?.({} as CloseEvent);
+      vi.advanceTimersByTime(1999);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(3);
+
+    act(() => {
+      handlers[2]?.onOpen?.();
+      handlers[2]?.onClose?.({} as CloseEvent);
+      vi.advanceTimersByTime(999);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(3);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connectBackendEventsMock).toHaveBeenCalledTimes(4);
+  });
 });

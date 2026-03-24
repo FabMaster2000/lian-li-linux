@@ -3,38 +3,56 @@ use crate::config::{xdg_config_home, xdg_runtime_dir};
 use crate::errors::ApiResult;
 use crate::models::{
     BackendAuthRuntime, BackendRuntime, ConfigDocument, DaemonRuntime, DaemonStatusResponse,
-    DeviceCapability, DeviceState, DeviceView, FanConfigDocument, FanCurveDocument,
-    FanCurvePointDocument, FanDeviceConfigDocument, FanManualRequest, FanSlotConfigDocument,
+    DeviceCapability, DeviceControllerContext, DeviceHealthState, DevicePresentationUpdateRequest,
+    DeviceState, DeviceView, DeviceWirelessContext, FanApplyRequest, FanApplyResponse,
+    FanApplySkip, FanConfigDocument, FanCurveDocument, FanCurvePointDocument,
+    FanCurveUpsertRequest, FanDeviceConfigDocument, FanManualRequest, FanSlotConfigDocument,
     FanSlotState, FanStateResponse, HealthResponse, LcdConfigDocument,
+    LightingApplyDeviceState, LightingApplyRequest, LightingApplyResponse, LightingApplySkip,
     LightingBrightnessRequest, LightingColorRequest, LightingConfigDocument,
-    LightingDeviceConfigDocument, LightingEffectRequest, LightingStateResponse,
-    LightingZoneConfigDocument, LightingZoneState, ProfileApplyResponse, ProfileApplySkip,
-    ProfileDocument, ProfileFanDocument, ProfileLightingDocument, ProfileMetadataDocument,
-    ProfileTargetsDocument, ProfileUpsertDocument, RuntimeResponse, SensorConfigDocument,
-    SensorRangeDocument, SensorSourceDocument, VersionResponse,
+    LightingDeviceConfigDocument, LightingEffectRequest,
+    LightingEffectRouteEntryDocument, LightingEffectRouteResponse,
+    LightingEffectRouteSaveRequest, LightingFanLedZoneConfigDocument,
+    LightingLedZoneConfigDocument, LightingStateResponse, LightingZoneConfigDocument,
+    LightingZoneState,
+    ProfileApplyResponse, ProfileApplySkip, ProfileDocument,
+    ProfileFanDocument, ProfileLightingDocument, ProfileMetadataDocument, ProfileTargetsDocument,
+    ProfileUpsertDocument, RuntimeResponse, SensorConfigDocument, SensorRangeDocument,
+    SensorSourceDocument, VersionResponse, WirelessConnectResponse, WirelessDisconnectResponse,
+    WirelessDiscoveryRefreshResponse,
 };
+use crate::storage::{DevicePresentationRecord, InventoryPresentation};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures_util::StreamExt;
 use lianli_shared::config::{AppConfig, HidDriver, LcdConfig};
+use lianli_shared::device_id::DeviceFamily;
 use lianli_shared::fan::{FanConfig, FanCurve, FanGroup, FanSpeed, MB_SYNC_KEY};
-use lianli_shared::ipc::{DeviceInfo, IpcRequest, IpcResponse, TelemetrySnapshot};
+use lianli_shared::ipc::{
+    DeviceInfo, FanTemperaturePreview, IpcRequest, IpcResponse, TelemetrySnapshot,
+    WirelessBindingState,
+};
 use lianli_shared::media::{MediaType, SensorDescriptor, SensorRange, SensorSourceConfig};
 use lianli_shared::rgb::{
-    RgbAppConfig, RgbDeviceConfig, RgbDirection, RgbEffect, RgbMode, RgbScope, RgbZoneConfig,
+    RgbAppConfig, RgbDeviceConfig, RgbDirection, RgbEffect, RgbEffectRouteEntry,
+    RgbFanLedZoneConfig, RgbLedZoneConfig, RgbMode, RgbScope, RgbZoneConfig,
+    MAX_EFFECT_SPEED,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::time::{interval, Duration as TokioDuration, MissedTickBehavior};
-
 pub async fn health() -> ApiResult<Json<HealthResponse>> {
     Ok(Json(HealthResponse { status: "ok" }))
 }
+
+const METEOR_FIXED_BRIGHTNESS_PERCENT: u8 = 100;
+const METEOR_FIXED_SMOOTHNESS_MS: u16 = 0;
+const METEOR_FIXED_DIRECTION: RgbDirection = RgbDirection::Clockwise;
 
 pub async fn version() -> ApiResult<Json<VersionResponse>> {
     Ok(Json(VersionResponse {
@@ -96,32 +114,148 @@ pub async fn daemon_status(State(state): State<AppState>) -> ApiResult<Json<Daem
 }
 
 pub async fn list_devices(State(state): State<AppState>) -> ApiResult<Json<Vec<DeviceView>>> {
-    let devices: Vec<DeviceInfo> = unwrap_response(state.daemon.send(&IpcRequest::ListDevices)?)?;
-    let telemetry: TelemetrySnapshot =
-        unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
-
-    let views = devices
-        .into_iter()
-        .map(|d| device_view(d, &telemetry))
-        .collect();
-
-    Ok(Json(views))
+    Ok(Json(load_device_views(&state)?))
 }
 
 pub async fn get_device(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> ApiResult<Json<DeviceView>> {
-    let devices: Vec<DeviceInfo> = unwrap_response(state.daemon.send(&IpcRequest::ListDevices)?)?;
-    let telemetry: TelemetrySnapshot =
-        unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
+    Ok(Json(find_device_view(&state, &id)?))
+}
 
-    let device = devices
-        .into_iter()
-        .find(|d| d.device_id == id)
-        .ok_or_else(|| crate::errors::ApiError::NotFound(format!("unknown device id: {id}")))?;
+pub async fn update_device_presentation(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<DevicePresentationUpdateRequest>,
+) -> ApiResult<Json<DeviceView>> {
+    let device = require_device(&state, &id)?;
+    let display_name = body.display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err(crate::errors::ApiError::BadRequest(
+            "display_name must not be empty".to_string(),
+        ));
+    }
 
-    Ok(Json(device_view(device, &telemetry)))
+    let controller = controller_identity(&device);
+    state.profiles.upsert_device_presentation(DevicePresentationRecord {
+        device_id: id.clone(),
+        display_name: Some(display_name.clone()),
+        ui_order: Some(body.ui_order),
+        physical_role: normalize_optional_value(body.physical_role),
+        cluster_label: normalize_optional_value(body.cluster_label),
+    })?;
+    state
+        .profiles
+        .upsert_controller_label(&controller.id, normalize_optional_value(body.controller_label))?;
+
+    state.events.publish(crate::events::WebEvent::new(
+        "device.updated",
+        "api",
+        Some(id.clone()),
+        serde_json::json!({
+            "reason": "presentation_updated",
+            "display_name": display_name,
+            "ui_order": body.ui_order,
+        }),
+    ));
+
+    Ok(Json(find_device_view(&state, &id)?))
+}
+
+pub async fn refresh_wireless_discovery(
+    State(state): State<AppState>,
+) -> ApiResult<Json<WirelessDiscoveryRefreshResponse>> {
+    let response: WirelessDiscoveryRefreshResponse =
+        unwrap_response(state.daemon.send(&IpcRequest::RefreshWirelessDiscovery)?)?;
+
+    state.events.publish(crate::events::WebEvent::new(
+        "device.updated",
+        "api",
+        None,
+        serde_json::json!({
+            "reason": "wireless_discovery_refreshed",
+            "device_count": response.device_count,
+        }),
+    ));
+
+    Ok(Json(response))
+}
+
+pub async fn connect_wireless_device(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Json<WirelessConnectResponse>> {
+    let device = require_device(&state, &id)?;
+    if device.wireless_channel.is_none() {
+        return Err(crate::errors::ApiError::BadRequest(
+            "device is not a wireless device".to_string(),
+        ));
+    }
+
+    match device.wireless_binding_state {
+        Some(WirelessBindingState::Connected) => {
+            return Ok(Json(WirelessConnectResponse {
+                device_id: id,
+                connected: true,
+            }));
+        }
+        Some(WirelessBindingState::Foreign) => {
+            return Err(crate::errors::ApiError::BadRequest(
+                "device is currently paired to another controller".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    let response: WirelessConnectResponse = unwrap_response(
+        state
+            .daemon
+            .send(&IpcRequest::BindWirelessDevice {
+                device_id: id.clone(),
+            })?,
+    )?;
+
+    state.events.publish(crate::events::WebEvent::new(
+        "device.updated",
+        "api",
+        Some(id),
+        serde_json::json!({
+            "reason": "wireless_connected",
+        }),
+    ));
+
+    Ok(Json(response))
+}
+pub async fn disconnect_wireless_device(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Json<WirelessDisconnectResponse>> {
+    let device = require_device(&state, &id)?;
+    if device.wireless_channel.is_none() {
+        return Err(crate::errors::ApiError::BadRequest(
+            "device is not a wireless device".to_string(),
+        ));
+    }
+
+    let response: WirelessDisconnectResponse = unwrap_response(
+        state
+            .daemon
+            .send(&IpcRequest::UnbindWirelessDevice {
+                device_id: id.clone(),
+            })?,
+    )?;
+
+    state.events.publish(crate::events::WebEvent::new(
+        "device.updated",
+        "api",
+        Some(id),
+        serde_json::json!({
+            "reason": "wireless_disconnected",
+        }),
+    ));
+
+    Ok(Json(response))
 }
 
 pub async fn get_api_config(State(state): State<AppState>) -> ApiResult<Json<ConfigDocument>> {
@@ -271,27 +405,27 @@ pub async fn get_lighting_state(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> ApiResult<Json<LightingStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let cfg = get_config(&state)?;
     let rgb = cfg.rgb.unwrap_or_default();
-    let zones = build_lighting_zones(&rgb, &id);
+    let zones = build_lighting_zones(&rgb, &device);
     Ok(Json(LightingStateResponse {
         device_id: id,
         zones,
     }))
 }
-
 pub async fn set_lighting_color(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<LightingColorRequest>,
 ) -> ApiResult<Json<LightingStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let zone = body.zone.unwrap_or(0);
     let color = parse_color(&body.color)?;
 
     let cfg = get_config(&state)?;
     let mut rgb = cfg.rgb.unwrap_or_default();
+    prune_lighting_zones(&mut rgb, &device);
     let mut effect = effect_for_zone(&rgb, &id, zone);
     effect.mode = RgbMode::Static;
     effect.colors = vec![color];
@@ -307,55 +441,61 @@ pub async fn set_lighting_color(
             "color": rgb_to_hex(color),
         }),
     );
-    let zones = build_lighting_zones(&rgb, &id);
+    let zones = build_lighting_zones(&rgb, &device);
     Ok(Json(LightingStateResponse {
         device_id: id,
         zones,
     }))
 }
-
 pub async fn set_lighting_effect(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<LightingEffectRequest>,
 ) -> ApiResult<Json<LightingStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let zone = body.zone.unwrap_or(0);
     let mode = parse_rgb_mode(&body.effect)?;
 
     let cfg = get_config(&state)?;
     let mut rgb = cfg.rgb.unwrap_or_default();
+    prune_lighting_zones(&mut rgb, &device);
     let mut effect = effect_for_zone(&rgb, &id, zone);
     effect.mode = mode;
 
     if let Some(speed) = body.speed {
-        if speed > 4 {
-            return Err(crate::errors::ApiError::BadRequest(
-                "speed must be 0-4".to_string(),
-            ));
-        }
+        validate_lighting_speed(speed)?;
         effect.speed = speed;
     }
 
-    if let Some(brightness) = body.brightness {
-        if brightness > 100 {
-            return Err(crate::errors::ApiError::BadRequest(
-                "brightness percent must be 0-100".to_string(),
-            ));
-        }
+    if mode == RgbMode::Meteor {
+        effect.brightness = percent_to_brightness(METEOR_FIXED_BRIGHTNESS_PERCENT);
+        effect.smoothness_ms = METEOR_FIXED_SMOOTHNESS_MS;
+        effect.direction = METEOR_FIXED_DIRECTION;
+    } else if let Some(brightness) = body.brightness {
+        validate_lighting_brightness(brightness)?;
         effect.brightness = percent_to_brightness(brightness);
     }
 
-    if let Some(color) = body.color {
-        effect.colors = vec![parse_color(&color)?];
+    let palette = parse_palette(&body.colors, body.color.as_ref())?;
+    if !palette.is_empty() {
+        effect.colors = palette;
     }
 
-    if let Some(direction) = body.direction {
-        effect.direction = parse_direction(&direction)?;
+    if mode != RgbMode::Meteor {
+        if let Some(direction) = body.direction {
+            effect.direction = parse_direction(&direction)?;
+        }
     }
 
     if let Some(scope) = body.scope {
         effect.scope = parse_scope(&scope)?;
+    }
+
+    if mode != RgbMode::Meteor {
+        if let Some(smoothness_ms) = body.smoothness_ms {
+            validate_lighting_smoothness(smoothness_ms)?;
+            effect.smoothness_ms = smoothness_ms;
+        }
     }
 
     upsert_zone_effect(&mut rgb, &id, zone, effect);
@@ -369,10 +509,131 @@ pub async fn set_lighting_effect(
             "effect": rgb_mode_name(mode),
         }),
     );
-    let zones = build_lighting_zones(&rgb, &id);
+    let zones = build_lighting_zones(&rgb, &device);
     Ok(Json(LightingStateResponse {
         device_id: id,
         zones,
+    }))
+}
+pub async fn apply_lighting_workbench(
+    State(state): State<AppState>,
+    Json(body): Json<LightingApplyRequest>,
+) -> ApiResult<Json<LightingApplyResponse>> {
+    let target_mode = parse_lighting_target_mode(&body.target_mode)?;
+    let zone_mode = parse_lighting_zone_mode(&body.zone_mode)?;
+    let mode = parse_rgb_mode(&body.effect)?;
+    validate_lighting_brightness(body.brightness)?;
+    if let Some(speed) = body.speed {
+        validate_lighting_speed(speed)?;
+    }
+    if mode != RgbMode::Meteor {
+        if let Some(smoothness_ms) = body.smoothness_ms {
+            validate_lighting_smoothness(smoothness_ms)?;
+        }
+    }
+    let palette = parse_palette(&body.colors, body.color.as_ref())?;
+
+    let cfg = get_config(&state)?;
+    let mut rgb = cfg.rgb.unwrap_or_default();
+    let devices: Vec<DeviceInfo> = unwrap_response(state.daemon.send(&IpcRequest::ListDevices)?)?;
+    let requested_device_ids = resolve_lighting_targets(target_mode, &body, &devices, &rgb)?;
+    let device_map = devices
+        .into_iter()
+        .map(|device| (device.device_id.clone(), device))
+        .collect::<HashMap<_, _>>();
+    let mut applied_devices = Vec::new();
+    let mut skipped_devices = Vec::new();
+
+    for device_id in &requested_device_ids {
+        let Some(device) = device_map.get(device_id) else {
+            skipped_devices.push(LightingApplySkip {
+                device_id: device_id.clone(),
+                reason: "device is not present in the current inventory".to_string(),
+            });
+            continue;
+        };
+
+        if let Some(reason) = lighting_apply_skip_reason(device, mode) {
+            skipped_devices.push(LightingApplySkip {
+                device_id: device.device_id.clone(),
+                reason,
+            });
+            continue;
+        }
+
+        prune_lighting_zones(&mut rgb, device);
+        let zones = match zones_for_lighting_apply(device, &rgb, zone_mode, body.zone) {
+            Ok(zones) => zones,
+            Err(reason) => {
+                skipped_devices.push(LightingApplySkip {
+                    device_id: device.device_id.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+
+        for zone in zones {
+            let mut effect = effect_for_zone(&rgb, &device.device_id, zone);
+            effect.mode = mode;
+            if !palette.is_empty() {
+                effect.colors = palette.clone();
+            }
+            if mode == RgbMode::Meteor {
+                effect.brightness = percent_to_brightness(METEOR_FIXED_BRIGHTNESS_PERCENT);
+                effect.smoothness_ms = METEOR_FIXED_SMOOTHNESS_MS;
+                effect.direction = METEOR_FIXED_DIRECTION;
+            } else {
+                effect.brightness = percent_to_brightness(body.brightness);
+            }
+            if let Some(speed) = body.speed {
+                effect.speed = speed;
+            }
+            if mode != RgbMode::Meteor {
+                if let Some(direction) = &body.direction {
+                    effect.direction = parse_direction(direction)?;
+                }
+            }
+            if let Some(scope) = &body.scope {
+                effect.scope = parse_scope(scope)?;
+            }
+            if mode != RgbMode::Meteor {
+                if let Some(smoothness_ms) = body.smoothness_ms {
+                    effect.smoothness_ms = smoothness_ms;
+                }
+            }
+            upsert_zone_effect(&mut rgb, &device.device_id, zone, effect);
+        }
+
+        applied_devices.push(LightingApplyDeviceState {
+            device_id: device.device_id.clone(),
+            zones: build_lighting_zones(&rgb, device),
+        });
+    }
+
+    if !applied_devices.is_empty() {
+        save_rgb_config(&state, rgb)?;
+        for device in &applied_devices {
+            state.events.publish_lighting_changed(
+                "api",
+                &device.device_id,
+                serde_json::json!({
+                    "reason": "workbench_apply",
+                    "target_mode": body.target_mode,
+                    "zone_mode": body.zone_mode,
+                    "sync_selected": body.sync_selected,
+                }),
+            );
+        }
+    }
+
+    Ok(Json(LightingApplyResponse {
+        target_mode: body.target_mode,
+        zone_mode: body.zone_mode,
+        requested_device_ids,
+        applied_devices,
+        skipped_devices,
+        sync_selected: body.sync_selected,
     }))
 }
 
@@ -381,7 +642,7 @@ pub async fn set_lighting_brightness(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<LightingBrightnessRequest>,
 ) -> ApiResult<Json<LightingStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let zone = body.zone.unwrap_or(0);
     if body.percent > 100 {
         return Err(crate::errors::ApiError::BadRequest(
@@ -391,6 +652,7 @@ pub async fn set_lighting_brightness(
 
     let cfg = get_config(&state)?;
     let mut rgb = cfg.rgb.unwrap_or_default();
+    prune_lighting_zones(&mut rgb, &device);
     let mut effect = effect_for_zone(&rgb, &id, zone);
     effect.brightness = percent_to_brightness(body.percent);
     upsert_zone_effect(&mut rgb, &id, zone, effect);
@@ -405,30 +667,52 @@ pub async fn set_lighting_brightness(
         }),
     );
 
-    let zones = build_lighting_zones(&rgb, &id);
+    let zones = build_lighting_zones(&rgb, &device);
     Ok(Json(LightingStateResponse {
         device_id: id,
         zones,
     }))
 }
 
+pub async fn get_lighting_effect_route(
+    State(state): State<AppState>,
+) -> ApiResult<Json<LightingEffectRouteResponse>> {
+    let rgb = get_config(&state)?.rgb.unwrap_or_default();
+    Ok(Json(LightingEffectRouteResponse {
+        route: document_effect_route_from_config(&rgb.effect_route),
+    }))
+}
+
+pub async fn save_lighting_effect_route(
+    State(state): State<AppState>,
+    Json(body): Json<LightingEffectRouteSaveRequest>,
+) -> ApiResult<Json<LightingEffectRouteResponse>> {
+    let mut rgb = get_config(&state)?.rgb.unwrap_or_default();
+    rgb.effect_route = effect_route_from_documents(body.route)?;
+    let route = document_effect_route_from_config(&rgb.effect_route);
+
+    save_rgb_config(&state, rgb)?;
+    state.events.publish_config_changed(
+        "api",
+        serde_json::json!({
+            "reason": "lighting_effect_route_saved",
+            "route_size": route.len(),
+        }),
+    );
+
+    Ok(Json(LightingEffectRouteResponse { route }))
+}
+
 pub async fn get_fan_state(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> ApiResult<Json<FanStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let cfg = get_config(&state)?;
     let telemetry: TelemetrySnapshot =
         unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
-    let (slots, update_interval_ms) = fan_slots_from_config(&cfg, &id);
-    let rpms = telemetry.fan_rpms.get(&id).cloned();
 
-    Ok(Json(FanStateResponse {
-        device_id: id,
-        update_interval_ms,
-        rpms,
-        slots,
-    }))
+    Ok(Json(build_fan_state_response(&cfg, &telemetry, &device)))
 }
 
 pub async fn set_fan_manual(
@@ -436,7 +720,7 @@ pub async fn set_fan_manual(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<FanManualRequest>,
 ) -> ApiResult<Json<FanStateResponse>> {
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     if body.percent > 100 {
         return Err(crate::errors::ApiError::BadRequest(
             "fan percent must be 0-100".to_string(),
@@ -452,22 +736,9 @@ pub async fn set_fan_manual(
 
     let cfg = get_config(&state)?;
     let mut fan_cfg = cfg.fans.clone().unwrap_or_else(default_fan_config);
-    let pwm = percent_to_pwm(body.percent);
-
-    let group = match fan_cfg
-        .speeds
-        .iter_mut()
-        .find(|g| g.device_id.as_deref() == Some(&id))
-    {
-        Some(g) => g,
-        None => {
-            fan_cfg.speeds.push(FanGroup {
-                device_id: Some(id.clone()),
-                speeds: default_fan_speeds(0),
-            });
-            fan_cfg.speeds.last_mut().unwrap()
-        }
-    };
+    let effective_percent = normalize_manual_percent_for_device(&device, body.percent);
+    let pwm = percent_to_pwm(effective_percent);
+    let group = ensure_fan_group_mut(&mut fan_cfg, &id);
 
     if let Some(slot) = body.slot {
         let idx = (slot - 1) as usize;
@@ -485,16 +756,305 @@ pub async fn set_fan_manual(
         serde_json::json!({
             "reason": "manual_set",
             "slot": body.slot,
-            "percent": body.percent,
+            "percent": effective_percent,
         }),
     );
-    let (slots, update_interval_ms) = fan_slots_from_config(&cfg.with_fans(fan_cfg), &id);
 
-    Ok(Json(FanStateResponse {
-        device_id: id,
-        update_interval_ms,
-        rpms: None,
-        slots,
+    let next_cfg = cfg.with_fans(fan_cfg);
+    let telemetry: TelemetrySnapshot =
+        unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
+
+    Ok(Json(build_fan_state_response(&next_cfg, &telemetry, &device)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FanTemperaturePreviewQuery {
+    source: String,
+}
+
+pub async fn preview_fan_temperature(
+    State(state): State<AppState>,
+    Query(query): Query<FanTemperaturePreviewQuery>,
+) -> ApiResult<Json<FanTemperaturePreview>> {
+    let source = query.source.trim();
+    if source.is_empty() {
+        return Err(crate::errors::ApiError::BadRequest(
+            "temperature source must not be empty".to_string(),
+        ));
+    }
+
+    let preview: FanTemperaturePreview = unwrap_response(
+        state.daemon.send(&IpcRequest::PreviewFanTemperature {
+            source: source.to_string(),
+        })?,
+    )?;
+
+    Ok(Json(preview))
+}
+
+pub async fn list_fan_curves(State(state): State<AppState>) -> ApiResult<Json<Vec<FanCurveDocument>>> {
+    let cfg = get_config(&state)?;
+    Ok(Json(fan_document_from_app_config(&cfg).curves))
+}
+
+pub async fn create_fan_curve(
+    State(state): State<AppState>,
+    Json(body): Json<FanCurveUpsertRequest>,
+) -> ApiResult<Json<FanCurveDocument>> {
+    let mut cfg = get_config(&state)?;
+    let mut fan_doc = fan_document_from_app_config(&cfg);
+    let saved_curve = FanCurveDocument {
+        name: body.name,
+        temperature_source: body.temperature_source,
+        points: body.points,
+    };
+    fan_doc.curves.push(saved_curve.clone());
+    cfg.fan_curves = fan_curves_from_document(&fan_doc)?;
+    save_app_config(&state, cfg)?;
+    state.events.publish_config_changed(
+        "api",
+        serde_json::json!({
+            "reason": "fan_curve_created",
+            "curve": saved_curve.name,
+        }),
+    );
+    Ok(Json(saved_curve))
+}
+
+pub async fn update_fan_curve(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(body): Json<FanCurveUpsertRequest>,
+) -> ApiResult<Json<FanCurveDocument>> {
+    let mut cfg = get_config(&state)?;
+    let mut fan_doc = fan_document_from_app_config(&cfg);
+    let mut replaced = false;
+    let saved_curve = FanCurveDocument {
+        name: body.name,
+        temperature_source: body.temperature_source,
+        points: body.points,
+    };
+
+    for curve in &mut fan_doc.curves {
+        if curve.name == name {
+            *curve = saved_curve.clone();
+            replaced = true;
+            break;
+        }
+    }
+
+    if !replaced {
+        return Err(crate::errors::ApiError::NotFound(format!(
+            "unknown fan curve: {name}"
+        )));
+    }
+
+    cfg.fan_curves = fan_curves_from_document(&fan_doc)?;
+    if name != saved_curve.name {
+        let curve_names = cfg
+            .fan_curves
+            .iter()
+            .map(|curve| curve.name.clone())
+            .collect::<HashSet<_>>();
+        let fans_doc = fan_document_from_app_config(&cfg);
+        cfg.fans = fan_config_from_document(fans_doc, &curve_names)?;
+    }
+    save_app_config(&state, cfg)?;
+    state.events.publish_config_changed(
+        "api",
+        serde_json::json!({
+            "reason": "fan_curve_updated",
+            "curve": saved_curve.name,
+            "previous_name": name,
+        }),
+    );
+    Ok(Json(saved_curve))
+}
+
+pub async fn delete_fan_curve(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut cfg = get_config(&state)?;
+    let in_use = cfg
+        .fans
+        .as_ref()
+        .map(|fans| {
+            fans.speeds
+                .iter()
+                .flat_map(|group| group.speeds.iter())
+                .filter(|speed| matches!(speed, FanSpeed::Curve(curve_name) if curve_name == &name))
+                .count()
+        })
+        .unwrap_or(0);
+
+    if in_use > 0 {
+        return Err(crate::errors::ApiError::BadRequest(format!(
+            "fan curve '{name}' is still referenced by {in_use} slot(s)"
+        )));
+    }
+
+    let original_len = cfg.fan_curves.len();
+    cfg.fan_curves.retain(|curve| curve.name != name);
+    if cfg.fan_curves.len() == original_len {
+        return Err(crate::errors::ApiError::NotFound(format!(
+            "unknown fan curve: {name}"
+        )));
+    }
+
+    save_app_config(&state, cfg)?;
+    state.events.publish_config_changed(
+        "api",
+        serde_json::json!({
+            "reason": "fan_curve_deleted",
+            "curve": name,
+        }),
+    );
+
+    Ok(Json(serde_json::json!({ "deleted": true, "name": name })))
+}
+
+pub async fn apply_fan_workbench(
+    State(state): State<AppState>,
+    Json(body): Json<FanApplyRequest>,
+) -> ApiResult<Json<FanApplyResponse>> {
+    let target_mode = parse_fan_target_mode(&body.target_mode)?;
+    let workbench_mode = parse_fan_workbench_mode(&body.mode)?;
+    let devices: Vec<DeviceInfo> = unwrap_response(state.daemon.send(&IpcRequest::ListDevices)?)?;
+    let requested_device_ids = resolve_fan_targets(target_mode, &body, &devices)?;
+    let device_map = devices
+        .into_iter()
+        .map(|device| (device.device_id.clone(), device))
+        .collect::<HashMap<_, _>>();
+    let cfg = get_config(&state)?;
+    let mut fan_cfg = cfg.fans.clone().unwrap_or_else(default_fan_config);
+    let curve_names = cfg
+        .fan_curves
+        .iter()
+        .map(|curve| curve.name.clone())
+        .collect::<HashSet<_>>();
+    let mut applied_device_ids = Vec::new();
+    let mut skipped_devices = Vec::new();
+    let manual_percent = if matches!(workbench_mode, FanWorkbenchMode::Manual) {
+        let percent = body.percent.ok_or_else(|| {
+            crate::errors::ApiError::BadRequest(
+                "percent is required for manual fan mode".to_string(),
+            )
+        })?;
+        if percent > 100 {
+            return Err(crate::errors::ApiError::BadRequest(
+                "fan percent must be 0-100".to_string(),
+            ));
+        }
+        Some(percent)
+    } else {
+        None
+    };
+    let curve_name = if matches!(workbench_mode, FanWorkbenchMode::Curve) {
+        let curve_name = body.curve.clone().ok_or_else(|| {
+            crate::errors::ApiError::BadRequest(
+                "curve is required for curve fan mode".to_string(),
+            )
+        })?;
+        if !curve_names.contains(&curve_name) {
+            return Err(crate::errors::ApiError::BadRequest(format!(
+                "unknown fan curve: {curve_name}"
+            )));
+        }
+        Some(curve_name)
+    } else {
+        None
+    };
+
+    for device_id in &requested_device_ids {
+        let Some(device) = device_map.get(device_id) else {
+            skipped_devices.push(FanApplySkip {
+                device_id: device_id.clone(),
+                reason: "device is not present in the current inventory".to_string(),
+            });
+            continue;
+        };
+
+        if !device.has_fan {
+            skipped_devices.push(FanApplySkip {
+                device_id: device.device_id.clone(),
+                reason: "device has no fan capability".to_string(),
+            });
+            continue;
+        }
+
+        if matches!(workbench_mode, FanWorkbenchMode::MbSync) && !device.mb_sync_support {
+            skipped_devices.push(FanApplySkip {
+                device_id: device.device_id.clone(),
+                reason: "motherboard RPM sync is not supported on this device".to_string(),
+            });
+            continue;
+        }
+
+        if matches!(workbench_mode, FanWorkbenchMode::StartStop) {
+            skipped_devices.push(FanApplySkip {
+                device_id: device.device_id.clone(),
+                reason: "start/stop mode is not supported by the current backend model".to_string(),
+            });
+            continue;
+        }
+
+        let speed = match workbench_mode {
+            FanWorkbenchMode::Manual => {
+                let percent = manual_percent.expect("manual percent validated above");
+                let effective_percent = normalize_manual_percent_for_device(device, percent);
+                FanSpeed::Constant(percent_to_pwm(effective_percent))
+            }
+            FanWorkbenchMode::Curve => {
+                FanSpeed::Curve(curve_name.clone().expect("curve validated above"))
+            }
+            FanWorkbenchMode::MbSync => FanSpeed::Curve(MB_SYNC_KEY.to_string()),
+            FanWorkbenchMode::StartStop => {
+                skipped_devices.push(FanApplySkip {
+                    device_id: device.device_id.clone(),
+                    reason: "fan mode could not be applied".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let group = ensure_fan_group_mut(&mut fan_cfg, &device.device_id);
+        group.speeds = std::array::from_fn(|_| speed.clone());
+        applied_device_ids.push(device.device_id.clone());
+    }
+
+    if !applied_device_ids.is_empty() {
+        save_fan_config(&state, fan_cfg.clone())?;
+        for device_id in &applied_device_ids {
+            state.events.publish_fan_changed(
+                "api",
+                device_id,
+                serde_json::json!({
+                    "reason": "workbench_apply",
+                    "target_mode": body.target_mode,
+                    "mode": body.mode,
+                    "curve": body.curve,
+                    "percent": body.percent,
+                }),
+            );
+        }
+    }
+
+    let telemetry: TelemetrySnapshot =
+        unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
+    let next_cfg = cfg.with_fans(fan_cfg);
+    let applied_devices = applied_device_ids
+        .iter()
+        .filter_map(|device_id| device_map.get(device_id))
+        .map(|device| build_fan_state_response(&next_cfg, &telemetry, device))
+        .collect();
+
+    Ok(Json(FanApplyResponse {
+        target_mode: body.target_mode,
+        mode: body.mode,
+        requested_device_ids,
+        applied_devices,
+        skipped_devices,
     }))
 }
 
@@ -554,16 +1114,397 @@ async fn handle_websocket(
     }
 }
 
-fn device_view(device: DeviceInfo, telemetry: &TelemetrySnapshot) -> DeviceView {
-    let fan_rpms = telemetry.fan_rpms.get(&device.device_id).cloned();
+#[derive(Clone)]
+struct ControllerIdentity {
+    id: String,
+    kind: String,
+    default_label: String,
+}
+
+#[derive(Clone, Copy)]
+enum LightingTargetMode {
+    Single,
+    Selected,
+    All,
+    Route,
+}
+
+#[derive(Clone, Copy)]
+enum LightingZoneMode {
+    Active,
+    AllZones,
+}
+
+#[derive(Clone, Copy)]
+enum FanTargetMode {
+    Single,
+    Selected,
+    All,
+}
+
+#[derive(Clone, Copy)]
+enum FanWorkbenchMode {
+    Manual,
+    Curve,
+    MbSync,
+    StartStop,
+}
+
+fn parse_lighting_target_mode(input: &str) -> ApiResult<LightingTargetMode> {
+    match input.trim().to_lowercase().as_str() {
+        "single" => Ok(LightingTargetMode::Single),
+        "selected" => Ok(LightingTargetMode::Selected),
+        "all" => Ok(LightingTargetMode::All),
+        "route" => Ok(LightingTargetMode::Route),
+        other => Err(crate::errors::ApiError::BadRequest(format!(
+            "unknown lighting target mode: {other}"
+        ))),
+    }
+}
+
+fn parse_lighting_zone_mode(input: &str) -> ApiResult<LightingZoneMode> {
+    match input.trim().to_lowercase().as_str() {
+        "active" => Ok(LightingZoneMode::Active),
+        "all_zones" | "all-zones" | "allzones" => Ok(LightingZoneMode::AllZones),
+        other => Err(crate::errors::ApiError::BadRequest(format!(
+            "unknown lighting zone mode: {other}"
+        ))),
+    }
+}
+
+fn resolve_lighting_targets(
+    target_mode: LightingTargetMode,
+    body: &LightingApplyRequest,
+    devices: &[DeviceInfo],
+    rgb: &RgbAppConfig,
+) -> ApiResult<Vec<String>> {
+    match target_mode {
+        LightingTargetMode::Single => {
+            let device_id = body
+                .device_id
+                .clone()
+                .or_else(|| body.device_ids.first().cloned())
+                .ok_or_else(|| {
+                    crate::errors::ApiError::BadRequest(
+                        "device_id required for single lighting target mode".to_string(),
+                    )
+                })?;
+            Ok(vec![device_id])
+        }
+        LightingTargetMode::Selected => {
+            let mut device_ids = body
+                .device_ids
+                .iter()
+                .filter(|device_id| !device_id.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            device_ids.sort();
+            device_ids.dedup();
+            if device_ids.is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "device_ids required for selected lighting target mode".to_string(),
+                ));
+            }
+            Ok(device_ids)
+        }
+        LightingTargetMode::All => Ok(devices
+            .iter()
+            .filter(|device| device.has_rgb)
+            .map(|device| device.device_id.clone())
+            .collect()),
+        LightingTargetMode::Route => {
+            let mut seen_device_ids = HashSet::new();
+            let route_device_ids = rgb
+                .effect_route
+                .iter()
+                .filter(|entry| !entry.device_id.trim().is_empty())
+                .filter(|entry| seen_device_ids.insert(entry.device_id.clone()))
+                .map(|entry| entry.device_id.clone())
+                .collect::<Vec<_>>();
+
+            if route_device_ids.is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "saved lighting effect route is empty".to_string(),
+                ));
+            }
+
+            Ok(route_device_ids)
+        }
+    }
+}
+
+fn parse_fan_target_mode(input: &str) -> ApiResult<FanTargetMode> {
+    match input.trim().to_lowercase().as_str() {
+        "single" => Ok(FanTargetMode::Single),
+        "selected" => Ok(FanTargetMode::Selected),
+        "all" => Ok(FanTargetMode::All),
+        other => Err(crate::errors::ApiError::BadRequest(format!(
+            "unknown fan target mode: {other}"
+        ))),
+    }
+}
+
+fn parse_fan_workbench_mode(input: &str) -> ApiResult<FanWorkbenchMode> {
+    match input.trim().to_lowercase().as_str() {
+        "manual" => Ok(FanWorkbenchMode::Manual),
+        "curve" => Ok(FanWorkbenchMode::Curve),
+        "mb_sync" | "mb-sync" | "mbsync" => Ok(FanWorkbenchMode::MbSync),
+        "start_stop" | "start-stop" | "startstop" => Ok(FanWorkbenchMode::StartStop),
+        other => Err(crate::errors::ApiError::BadRequest(format!(
+            "unknown fan mode: {other}"
+        ))),
+    }
+}
+
+fn resolve_fan_targets(
+    target_mode: FanTargetMode,
+    body: &FanApplyRequest,
+    devices: &[DeviceInfo],
+) -> ApiResult<Vec<String>> {
+    match target_mode {
+        FanTargetMode::Single => {
+            let device_id = body
+                .device_id
+                .clone()
+                .or_else(|| body.device_ids.first().cloned())
+                .ok_or_else(|| {
+                    crate::errors::ApiError::BadRequest(
+                        "device_id required for single fan target mode".to_string(),
+                    )
+                })?;
+            Ok(vec![device_id])
+        }
+        FanTargetMode::Selected => {
+            let mut device_ids = body
+                .device_ids
+                .iter()
+                .filter(|device_id| !device_id.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            device_ids.sort();
+            device_ids.dedup();
+            if device_ids.is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "device_ids required for selected fan target mode".to_string(),
+                ));
+            }
+            Ok(device_ids)
+        }
+        FanTargetMode::All => Ok(devices
+            .iter()
+            .filter(|device| device.has_fan)
+            .map(|device| device.device_id.clone())
+            .collect()),
+    }
+}
+
+fn validate_lighting_speed(speed: u8) -> ApiResult<()> {
+    if speed > MAX_EFFECT_SPEED {
+        return Err(crate::errors::ApiError::BadRequest(
+            format!("speed must be 0-{MAX_EFFECT_SPEED}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lighting_brightness(brightness: u8) -> ApiResult<()> {
+    if brightness > 100 {
+        return Err(crate::errors::ApiError::BadRequest(
+            "brightness percent must be 0-100".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_SMOOTHNESS_MS: u16 = 3000;
+
+fn validate_lighting_smoothness(smoothness_ms: u16) -> ApiResult<()> {
+    if smoothness_ms > MAX_SMOOTHNESS_MS {
+        return Err(crate::errors::ApiError::BadRequest(
+            format!("smoothness_ms must be 0-{MAX_SMOOTHNESS_MS}"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_palette(colors: &[crate::models::ColorValue], color: Option<&crate::models::ColorValue>) -> ApiResult<Vec<[u8; 3]>> {
+    let mut palette = if !colors.is_empty() {
+        colors
+            .iter()
+            .map(parse_color)
+            .collect::<ApiResult<Vec<_>>>()?
+    } else if let Some(color) = color {
+        vec![parse_color(color)?]
+    } else {
+        vec![[255, 255, 255]]
+    };
+
+    if palette.len() > 4 {
+        return Err(crate::errors::ApiError::BadRequest(
+            "palette supports up to 4 colors".to_string(),
+        ));
+    }
+
+    if palette.is_empty() {
+        palette.push([255, 255, 255]);
+    }
+
+    Ok(palette)
+}
+
+fn lighting_apply_skip_reason(device: &DeviceInfo, mode: RgbMode) -> Option<String> {
+    if !device.has_rgb {
+        return Some("device does not expose RGB control".to_string());
+    }
+
+    if mode == RgbMode::Direct {
+        return Some("Direct mode is not exposed by the current web workbench".to_string());
+    }
+
+    if matches!(mode, RgbMode::BigBang | RgbMode::Vortex | RgbMode::Pump | RgbMode::ColorsMorph)
+        && !device.has_pump
+    {
+        return Some("selected effect is limited to pump-capable devices".to_string());
+    }
+
+    None
+}
+
+fn zones_for_lighting_apply(
+    device: &DeviceInfo,
+    rgb: &RgbAppConfig,
+    zone_mode: LightingZoneMode,
+    zone: Option<u8>,
+) -> Result<Vec<u8>, String> {
+    let available_zones = effective_zone_indexes(rgb, device);
+
+    match zone_mode {
+        LightingZoneMode::Active => {
+            let requested_zone = zone.unwrap_or(0);
+            if !available_zones.contains(&requested_zone) {
+                return Err(format!(
+                    "requested zone {requested_zone} is outside the available zone range"
+                ));
+            }
+            Ok(vec![requested_zone])
+        }
+        LightingZoneMode::AllZones => {
+            if available_zones.is_empty() {
+                return Err("device reports no RGB zones".to_string());
+            }
+            Ok(available_zones)
+        }
+    }
+}
+
+fn load_device_views(state: &AppState) -> ApiResult<Vec<DeviceView>> {
+    let devices: Vec<DeviceInfo> = unwrap_response(state.daemon.send(&IpcRequest::ListDevices)?)?;
+    let telemetry: TelemetrySnapshot =
+        unwrap_response(state.daemon.send(&IpcRequest::GetTelemetry)?)?;
+    let presentation = state.profiles.inventory_presentation()?;
+    let controller_counts = devices.iter().fold(HashMap::new(), |mut counts, device| {
+        let controller = controller_identity(device);
+        *counts.entry(controller.id).or_insert(0) += 1;
+        counts
+    });
+    let mut views = devices
+        .into_iter()
+        .enumerate()
+        .map(|(index, device)| device_view(device, index, &telemetry, &presentation, &controller_counts))
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| {
+        left.ui_order
+            .cmp(&right.ui_order)
+            .then(left.controller.label.cmp(&right.controller.label))
+            .then(left.display_name.cmp(&right.display_name))
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(views)
+}
+
+fn find_device_view(state: &AppState, id: &str) -> ApiResult<DeviceView> {
+    load_device_views(state)?
+        .into_iter()
+        .find(|device| device.id == id)
+        .ok_or_else(|| crate::errors::ApiError::NotFound(format!("unknown device id: {id}")))
+}
+
+fn device_view(
+    device: DeviceInfo,
+    index: usize,
+    telemetry: &TelemetrySnapshot,
+    presentation: &InventoryPresentation,
+    controller_counts: &HashMap<String, usize>,
+) -> DeviceView {
+    let telemetry_fan_rpms = telemetry.fan_rpms.get(&device.device_id).cloned();
+    let online = device_online(&device, &telemetry_fan_rpms);
+    let fan_rpms = online.then(|| telemetry_fan_rpms.clone()).flatten();
     let coolant_temp = telemetry.coolant_temps.get(&device.device_id).cloned();
-    let online = true;
+    let presentation_record = presentation.device_presentations.get(&device.device_id);
+    let controller = controller_identity(&device);
+    let controller_label = presentation
+        .controller_labels
+        .get(&controller.id)
+        .cloned()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| controller.default_label.clone());
+    let display_name = presentation_record
+        .and_then(|record| record.display_name.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_device_display_name(&device));
+    let cluster_label = presentation_record
+        .and_then(|record| record.cluster_label.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| display_name.clone());
+    let ui_order = presentation_record
+        .and_then(|record| record.ui_order)
+        .unwrap_or((index as u32) * 10);
+    let physical_role = presentation_record
+        .and_then(|record| record.physical_role.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_physical_role(&device));
+    let controller_device_count = controller_counts.get(&controller.id).copied().unwrap_or(1);
+    let capability_summary = capability_summary(&device);
+    let current_mode_summary =
+        current_mode_summary(&device, online, &fan_rpms, telemetry_fan_rpms.as_ref(), telemetry);
+    let health =
+        health_state(&device, online, &fan_rpms, telemetry_fan_rpms.as_ref(), coolant_temp);
 
     DeviceView {
         id: device.device_id.clone(),
         name: device.name,
+        display_name,
         family: format!("{:?}", device.family),
         online,
+        ui_order,
+        physical_role,
+        capability_summary,
+        current_mode_summary,
+        controller: DeviceControllerContext {
+            id: controller.id.clone(),
+            label: if controller.kind == "wireless_mesh" || controller_device_count <= 1 {
+                controller_label
+            } else {
+                format!("{} ({controller_device_count} devices)", controller_label)
+            },
+            kind: controller.kind,
+        },
+        wireless: if device.device_id.starts_with("wireless:") {
+            Some(DeviceWirelessContext {
+                transport: "wireless".to_string(),
+                channel: device.wireless_channel,
+                group_id: Some(device.device_id.clone()),
+                group_label: Some(cluster_label),
+                binding_state: device
+                    .wireless_binding_state
+                    .map(wireless_binding_state_name),
+                master_mac: device.wireless_master_mac.clone(),
+            })
+        } else {
+            None
+        },
+        health,
         capabilities: DeviceCapability {
             has_fan: device.has_fan,
             has_rgb: device.has_rgb,
@@ -580,6 +1521,301 @@ fn device_view(device: DeviceInfo, telemetry: &TelemetrySnapshot) -> DeviceView 
             streaming_active: Some(telemetry.streaming_active),
         },
     }
+}
+
+fn wireless_binding_state_name(state: WirelessBindingState) -> String {
+    match state {
+        WirelessBindingState::Connected => "connected".to_string(),
+        WirelessBindingState::Available => "available".to_string(),
+        WirelessBindingState::Foreign => "foreign".to_string(),
+    }
+}
+fn controller_identity(device: &DeviceInfo) -> ControllerIdentity {
+    if device.device_id.starts_with("wireless:") {
+        return ControllerIdentity {
+            id: "wireless:mesh".to_string(),
+            kind: "wireless_mesh".to_string(),
+            default_label: "Wireless dongle".to_string(),
+        };
+    }
+
+    if let Some((base_id, _)) = device.device_id.rsplit_once(":port") {
+        return ControllerIdentity {
+            id: base_id.to_string(),
+            kind: "wired_controller".to_string(),
+            default_label: device
+                .name
+                .split(" Port ")
+                .next()
+                .unwrap_or(&device.name)
+                .to_string(),
+        };
+    }
+
+    ControllerIdentity {
+        id: device.device_id.clone(),
+        kind: if device.has_fan || device.has_rgb {
+            "controller".to_string()
+        } else {
+            "standalone".to_string()
+        },
+        default_label: device.name.clone(),
+    }
+}
+
+fn default_device_display_name(device: &DeviceInfo) -> String {
+    if device.device_id.starts_with("wireless:") {
+        return format!(
+            "{} {} [{}]",
+            device.name,
+            wireless_cluster_role(device),
+            short_wireless_identity(&device.device_id)
+        );
+    }
+
+    device.name.clone()
+}
+
+fn wireless_cluster_role(device: &DeviceInfo) -> String {
+    match device.fan_count {
+        Some(1) => "single-fan cluster".to_string(),
+        Some(count) => format!("{count}-fan cluster"),
+        None => "wireless cluster".to_string(),
+    }
+}
+
+fn short_wireless_identity(device_id: &str) -> String {
+    let tail = device_id.strip_prefix("wireless:").unwrap_or(device_id);
+    let segments = tail.split(':').collect::<Vec<_>>();
+
+    if segments.len() >= 4 {
+        return format!(
+            "{}:{}..{}:{}",
+            segments[0],
+            segments[1],
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        );
+    }
+
+    if segments.len() >= 2 {
+        format!("{}:{}", segments[segments.len() - 2], segments[segments.len() - 1])
+    } else {
+        tail.to_string()
+    }
+}
+
+fn default_physical_role(device: &DeviceInfo) -> String {
+    if let Some((_, port)) = device.device_id.rsplit_once(":port") {
+        return format!("Port {port}");
+    }
+
+    if device.device_id.starts_with("wireless:") {
+        return wireless_cluster_role(device);
+    }
+
+    if device.has_pump {
+        return "Pump device".to_string();
+    }
+
+    if device.has_lcd && device.has_fan {
+        return "LCD cooling device".to_string();
+    }
+
+    if device.has_lcd {
+        return "LCD device".to_string();
+    }
+
+    if device.has_fan && device.has_rgb {
+        return "Cooling and lighting device".to_string();
+    }
+
+    if device.has_fan {
+        return "Cooling device".to_string();
+    }
+
+    if device.has_rgb {
+        return "Lighting device".to_string();
+    }
+
+    "Peripheral".to_string()
+}
+
+fn capability_summary(device: &DeviceInfo) -> String {
+    let mut items = Vec::new();
+
+    if device.has_rgb {
+        items.push(match device.rgb_zone_count {
+            Some(count) => format!("{count} RGB zone(s)"),
+            None => "RGB control".to_string(),
+        });
+    }
+
+    if device.has_fan {
+        items.push(match device.fan_count {
+            Some(count) => format!("{count} fan slot(s)"),
+            None => "Fan control".to_string(),
+        });
+    }
+
+    if device.has_lcd {
+        items.push("LCD".to_string());
+    }
+
+    if device.has_pump {
+        items.push("Pump telemetry".to_string());
+    }
+
+    if device.mb_sync_support {
+        items.push("Motherboard sync".to_string());
+    }
+
+    if items.is_empty() {
+        "Inventory only".to_string()
+    } else {
+        items.join(" | ")
+    }
+}
+
+fn current_mode_summary(
+    device: &DeviceInfo,
+    online: bool,
+    fan_rpms: &Option<Vec<u16>>,
+    telemetry_fan_rpms: Option<&Vec<u16>>,
+    telemetry: &TelemetrySnapshot,
+) -> String {
+    if !online {
+        return offline_mode_summary(device, telemetry_fan_rpms);
+    }
+
+    let mut items = Vec::new();
+
+    if device.has_rgb {
+        items.push("Lighting ready".to_string());
+    }
+
+    if device.has_fan {
+        if fan_rpms.as_ref().is_some_and(|rpms| !rpms.is_empty()) {
+            items.push("Cooling telemetry live".to_string());
+        } else {
+            items.push("Cooling ready".to_string());
+        }
+    }
+
+    if device.has_lcd {
+        items.push(if telemetry.streaming_active {
+            "LCD streaming active".to_string()
+        } else {
+            "LCD idle".to_string()
+        });
+    }
+
+    if items.is_empty() {
+        "Inventory only".to_string()
+    } else {
+        items.join(" | ")
+    }
+}
+
+fn health_state(
+    device: &DeviceInfo,
+    online: bool,
+    fan_rpms: &Option<Vec<u16>>,
+    telemetry_fan_rpms: Option<&Vec<u16>>,
+    coolant_temp: Option<f32>,
+) -> DeviceHealthState {
+    if !online {
+        return DeviceHealthState {
+            level: "offline".to_string(),
+            summary: offline_health_summary(device, telemetry_fan_rpms),
+        };
+    }
+
+    if device.has_fan {
+        match fan_rpms {
+            Some(rpms) if !rpms.is_empty() => {}
+            _ => {
+                return DeviceHealthState {
+                    level: "warning".to_string(),
+                    summary: "Fan telemetry missing".to_string(),
+                }
+            }
+        }
+    }
+
+    if device.has_pump && coolant_temp.is_none() {
+        return DeviceHealthState {
+            level: "warning".to_string(),
+            summary: "Pump telemetry missing".to_string(),
+        };
+    }
+
+    DeviceHealthState {
+        level: "healthy".to_string(),
+        summary: "Device inventory healthy".to_string(),
+    }
+}
+
+fn device_online(device: &DeviceInfo, telemetry_fan_rpms: &Option<Vec<u16>>) -> bool {
+    if device.wireless_missed_polls.unwrap_or(0) > 0 {
+        return false;
+    }
+
+    if device.wireless_channel.is_some()
+        && device.has_fan
+        && telemetry_fan_rpms
+            .as_ref()
+            .is_some_and(|rpms| !rpms.is_empty() && rpms.iter().all(|rpm| *rpm == 0))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn offline_mode_summary(device: &DeviceInfo, telemetry_fan_rpms: Option<&Vec<u16>>) -> String {
+    if device_is_powered_off(device, telemetry_fan_rpms) {
+        if device.wireless_channel.is_some() {
+            "Wireless device powered off".to_string()
+        } else {
+            "Device powered off".to_string()
+        }
+    } else if device.wireless_channel.is_some() {
+        "Wireless device offline".to_string()
+    } else {
+        "Device offline".to_string()
+    }
+}
+
+fn offline_health_summary(device: &DeviceInfo, telemetry_fan_rpms: Option<&Vec<u16>>) -> String {
+    if device_is_powered_off(device, telemetry_fan_rpms) {
+        if device.wireless_channel.is_some() {
+            "Wireless device is connected but currently powered off".to_string()
+        } else {
+            "Device is currently powered off".to_string()
+        }
+    } else if device.wireless_channel.is_some() {
+        "Wireless device not seen in the latest discovery poll".to_string()
+    } else {
+        "Device is offline".to_string()
+    }
+}
+
+fn device_is_powered_off(device: &DeviceInfo, telemetry_fan_rpms: Option<&Vec<u16>>) -> bool {
+    device.has_fan
+        && telemetry_fan_rpms
+            .is_some_and(|rpms| !rpms.is_empty() && rpms.iter().all(|rpm| *rpm == 0))
+}
+
+fn normalize_optional_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 fn unwrap_response<T: serde::de::DeserializeOwned>(response: IpcResponse) -> ApiResult<T> {
@@ -659,16 +1895,36 @@ fn app_config_from_document(doc: ConfigDocument, daemon_config_path: &std::path:
 }
 
 fn lighting_document_from_rgb_config(cfg: RgbAppConfig) -> LightingConfigDocument {
+    let RgbAppConfig {
+        enabled,
+        openrgb_server,
+        openrgb_port,
+        global_led_zones,
+        fan_led_zones,
+        effect_route,
+        devices,
+    } = cfg;
+
     LightingConfigDocument {
-        enabled: cfg.enabled,
-        openrgb_server: cfg.openrgb_server,
-        openrgb_port: cfg.openrgb_port,
-        devices: cfg
-            .devices
+        enabled,
+        openrgb_server,
+        openrgb_port,
+        global_led_zones: document_led_zones_from_config(&global_led_zones),
+        fan_led_zones: document_fan_led_zones_from_config(&fan_led_zones),
+        effect_route: document_effect_route_from_config(&effect_route),
+        devices: devices
             .into_iter()
             .map(|device| LightingDeviceConfigDocument {
                 device_id: device.device_id,
                 motherboard_sync: device.mb_rgb_sync,
+                led_zones: device
+                    .led_zones
+                    .into_iter()
+                    .map(|zone| LightingLedZoneConfigDocument {
+                        zone: zone.zone_index,
+                        led_indexes: zone.led_indexes,
+                    })
+                    .collect(),
                 zones: device
                     .zones
                     .into_iter()
@@ -682,6 +1938,7 @@ fn lighting_document_from_rgb_config(cfg: RgbAppConfig) -> LightingConfigDocumen
                         scope: rgb_scope_name(zone.effect.scope),
                         swap_left_right: zone.swap_lr,
                         swap_top_bottom: zone.swap_tb,
+                        smoothness_ms: zone.effect.smoothness_ms,
                     })
                     .collect(),
             })
@@ -694,8 +1951,79 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
         enabled,
         openrgb_server,
         openrgb_port,
+        global_led_zones,
+        fan_led_zones,
+        effect_route,
         devices,
     } = doc;
+
+    let mut seen_global_led_zones = HashSet::new();
+    let global_led_zones = global_led_zones
+        .into_iter()
+        .map(|zone| {
+            if !seen_global_led_zones.insert(zone.zone) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate global lighting led zone {}",
+                    zone.zone
+                )));
+            }
+
+            Ok(RgbLedZoneConfig {
+                zone_index: zone.zone,
+                led_indexes: zone.led_indexes,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+
+    let mut seen_fan_led_zones = HashSet::new();
+    let fan_led_zones = fan_led_zones
+        .into_iter()
+        .map(|fan| {
+            if fan.device_id.trim().is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting fan_led_zones device_id must not be empty".to_string(),
+                ));
+            }
+            if fan.fan_index == 0 {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting fan_led_zones fan_index must be greater than zero".to_string(),
+                ));
+            }
+            if !seen_fan_led_zones.insert((fan.device_id.clone(), fan.fan_index)) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate lighting fan led layout for {} fan {}",
+                    fan.device_id, fan.fan_index
+                )));
+            }
+
+            let mut seen_zones = HashSet::new();
+            let zones = fan
+                .zones
+                .into_iter()
+                .map(|zone| {
+                    if !seen_zones.insert(zone.zone) {
+                        return Err(crate::errors::ApiError::BadRequest(format!(
+                            "duplicate lighting led zone {} for {} fan {}",
+                            zone.zone, fan.device_id, fan.fan_index
+                        )));
+                    }
+
+                    Ok(RgbLedZoneConfig {
+                        zone_index: zone.zone,
+                        led_indexes: zone.led_indexes,
+                    })
+                })
+                .collect::<ApiResult<Vec<_>>>()?;
+
+            Ok(RgbFanLedZoneConfig {
+                device_id: fan.device_id,
+                fan_index: fan.fan_index,
+                zones,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+
+    let effect_route = effect_route_from_documents(effect_route)?;
 
     let mut seen_devices = HashSet::new();
     let devices = devices
@@ -714,6 +2042,24 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
             }
 
             let device_id = device.device_id.clone();
+            let mut seen_led_zones = HashSet::new();
+            let led_zones = device
+                .led_zones
+                .into_iter()
+                .map(|zone| {
+                    if !seen_led_zones.insert(zone.zone) {
+                        return Err(crate::errors::ApiError::BadRequest(format!(
+                            "duplicate lighting led zone {} for device {}",
+                            zone.zone, device_id
+                        )));
+                    }
+
+                    Ok(RgbLedZoneConfig {
+                        zone_index: zone.zone,
+                        led_indexes: zone.led_indexes,
+                    })
+                })
+                .collect::<ApiResult<Vec<_>>>()?;
             let mut seen_zones = HashSet::new();
             let zones = device
                 .zones
@@ -725,9 +2071,9 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
                             zone.zone, device_id
                         )));
                     }
-                    if zone.speed > 4 {
+                    if zone.speed > MAX_EFFECT_SPEED {
                         return Err(crate::errors::ApiError::BadRequest(
-                            "lighting speed must be 0-4".to_string(),
+                            format!("lighting speed must be 0-{MAX_EFFECT_SPEED}"),
                         ));
                     }
                     if zone.brightness_percent > 100 {
@@ -754,6 +2100,7 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
                             brightness: percent_to_brightness(zone.brightness_percent),
                             direction: parse_direction(&zone.direction)?,
                             scope: parse_scope(&zone.scope)?,
+                            smoothness_ms: zone.smoothness_ms,
                         },
                         swap_lr: zone.swap_left_right,
                         swap_tb: zone.swap_top_bottom,
@@ -764,6 +2111,7 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
             Ok(RgbDeviceConfig {
                 device_id,
                 mb_rgb_sync: device.motherboard_sync,
+                led_zones,
                 zones,
             })
         })
@@ -773,10 +2121,20 @@ fn rgb_config_from_document(doc: LightingConfigDocument) -> ApiResult<Option<Rgb
         enabled,
         openrgb_server,
         openrgb_port,
+        global_led_zones,
+        fan_led_zones,
+        effect_route,
         devices,
     };
 
-    if rgb.enabled && !rgb.openrgb_server && rgb.openrgb_port == 6743 && rgb.devices.is_empty() {
+    if rgb.enabled
+        && !rgb.openrgb_server
+        && rgb.openrgb_port == 6743
+        && rgb.global_led_zones.is_empty()
+        && rgb.fan_led_zones.is_empty()
+        && rgb.effect_route.is_empty()
+        && rgb.devices.is_empty()
+    {
         Ok(None)
     } else {
         Ok(Some(rgb))
@@ -1176,6 +2534,66 @@ fn validate_app_config(cfg: &AppConfig, daemon_config_path: &std::path::Path) ->
     }
 
     if let Some(rgb) = &cfg.rgb {
+        let mut seen_global_led_zones = HashSet::new();
+        for led_zone in &rgb.global_led_zones {
+            if !seen_global_led_zones.insert(led_zone.zone_index) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate global lighting led zone {}",
+                    led_zone.zone_index
+                )));
+            }
+        }
+
+        let mut seen_fan_led_zones = HashSet::new();
+        for fan_layout in &rgb.fan_led_zones {
+            if fan_layout.device_id.trim().is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting fan_led_zones device_id must not be empty".to_string(),
+                ));
+            }
+            if fan_layout.fan_index == 0 {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting fan_led_zones fan_index must be greater than zero".to_string(),
+                ));
+            }
+            if !seen_fan_led_zones.insert((fan_layout.device_id.clone(), fan_layout.fan_index)) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate lighting fan led layout for {} fan {}",
+                    fan_layout.device_id, fan_layout.fan_index
+                )));
+            }
+
+            let mut seen_led_zones = HashSet::new();
+            for led_zone in &fan_layout.zones {
+                if !seen_led_zones.insert(led_zone.zone_index) {
+                    return Err(crate::errors::ApiError::BadRequest(format!(
+                        "duplicate lighting led zone {} for {} fan {}",
+                        led_zone.zone_index, fan_layout.device_id, fan_layout.fan_index
+                    )));
+                }
+            }
+        }
+
+        let mut seen_effect_route = HashSet::new();
+        for entry in &rgb.effect_route {
+            if entry.device_id.trim().is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting effect_route device_id must not be empty".to_string(),
+                ));
+            }
+            if entry.fan_index == 0 {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting effect_route fan_index must be greater than zero".to_string(),
+                ));
+            }
+            if !seen_effect_route.insert((entry.device_id.clone(), entry.fan_index)) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate lighting effect route entry for {} fan {}",
+                    entry.device_id, entry.fan_index
+                )));
+            }
+        }
+
         for device in &rgb.devices {
             if device.device_id.trim().is_empty() {
                 return Err(crate::errors::ApiError::BadRequest(
@@ -1183,10 +2601,20 @@ fn validate_app_config(cfg: &AppConfig, daemon_config_path: &std::path::Path) ->
                 ));
             }
 
+            let mut seen_led_zones = HashSet::new();
+            for led_zone in &device.led_zones {
+                if !seen_led_zones.insert(led_zone.zone_index) {
+                    return Err(crate::errors::ApiError::BadRequest(format!(
+                        "duplicate lighting led zone {} for device {}",
+                        led_zone.zone_index, device.device_id
+                    )));
+                }
+            }
+
             for zone in &device.zones {
-                if zone.effect.speed > 4 {
+                if zone.effect.speed > MAX_EFFECT_SPEED {
                     return Err(crate::errors::ApiError::BadRequest(
-                        "lighting speed must be 0-4".to_string(),
+                        format!("lighting speed must be 0-{MAX_EFFECT_SPEED}"),
                     ));
                 }
                 if zone.effect.brightness > 4 {
@@ -1375,9 +2803,9 @@ fn validate_profile_lighting(lighting: &ProfileLightingDocument) -> ApiResult<()
     }
 
     if let Some(speed) = lighting.speed {
-        if speed > 4 {
+        if speed > MAX_EFFECT_SPEED {
             return Err(crate::errors::ApiError::BadRequest(
-                "profile lighting speed must be 0-4".to_string(),
+                format!("profile lighting speed must be 0-{MAX_EFFECT_SPEED}"),
             ));
         }
     }
@@ -1476,7 +2904,8 @@ fn apply_profile_lighting(
             continue;
         }
 
-        let zone_indexes = existing_or_default_zone_indexes(rgb, &device.device_id);
+        prune_lighting_zones(rgb, device);
+        let zone_indexes = existing_or_default_zone_indexes(rgb, device);
         for zone in zone_indexes {
             let mut effect = effect_for_zone(rgb, &device.device_id, zone);
             if let Some(mode) = target_mode {
@@ -1561,16 +2990,8 @@ fn apply_profile_fans(
     Ok(())
 }
 
-fn existing_or_default_zone_indexes(cfg: &RgbAppConfig, device_id: &str) -> Vec<u8> {
-    let Some(device) = cfg.devices.iter().find(|device| device.device_id == device_id) else {
-        return vec![0];
-    };
-
-    if device.zones.is_empty() {
-        vec![0]
-    } else {
-        device.zones.iter().map(|zone| zone.zone_index).collect()
-    }
+fn existing_or_default_zone_indexes(cfg: &RgbAppConfig, device: &DeviceInfo) -> Vec<u8> {
+    effective_zone_indexes(cfg, device)
 }
 
 fn save_rgb_config(state: &AppState, cfg: RgbAppConfig) -> ApiResult<()> {
@@ -1587,26 +3008,217 @@ fn save_fan_config(state: &AppState, cfg: FanConfig) -> ApiResult<()> {
     }
 }
 
-fn build_lighting_zones(cfg: &RgbAppConfig, device_id: &str) -> Vec<LightingZoneState> {
-    let Some(dev) = cfg.devices.iter().find(|d| d.device_id == device_id) else {
-        return Vec::new();
+fn document_led_zones_from_config(led_zones: &[RgbLedZoneConfig]) -> Vec<LightingLedZoneConfigDocument> {
+    let mut zones = led_zones
+        .iter()
+        .map(|zone| LightingLedZoneConfigDocument {
+            zone: zone.zone_index,
+            led_indexes: zone.led_indexes.clone(),
+        })
+        .collect::<Vec<_>>();
+    zones.sort_by_key(|zone| zone.zone);
+    zones
+}
+
+fn document_fan_led_zones_from_config(
+    fan_led_zones: &[RgbFanLedZoneConfig],
+) -> Vec<LightingFanLedZoneConfigDocument> {
+    let mut documents = fan_led_zones
+        .iter()
+        .map(|fan| LightingFanLedZoneConfigDocument {
+            device_id: fan.device_id.clone(),
+            fan_index: fan.fan_index,
+            zones: document_led_zones_from_config(&fan.zones),
+        })
+        .collect::<Vec<_>>();
+    documents.sort_by(|left, right| {
+        left.device_id
+            .cmp(&right.device_id)
+            .then(left.fan_index.cmp(&right.fan_index))
+    });
+    documents
+}
+
+fn document_effect_route_from_config(
+    effect_route: &[RgbEffectRouteEntry],
+) -> Vec<LightingEffectRouteEntryDocument> {
+    effect_route
+        .iter()
+        .map(|entry| LightingEffectRouteEntryDocument {
+            device_id: entry.device_id.clone(),
+            fan_index: entry.fan_index,
+        })
+        .collect()
+}
+
+fn effect_route_from_documents(
+    route: Vec<LightingEffectRouteEntryDocument>,
+) -> ApiResult<Vec<RgbEffectRouteEntry>> {
+    let mut seen_entries = HashSet::new();
+
+    route
+        .into_iter()
+        .map(|entry| {
+            if entry.device_id.trim().is_empty() {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting effect_route device_id must not be empty".to_string(),
+                ));
+            }
+            if entry.fan_index == 0 {
+                return Err(crate::errors::ApiError::BadRequest(
+                    "lighting effect_route fan_index must be greater than zero".to_string(),
+                ));
+            }
+            if !seen_entries.insert((entry.device_id.clone(), entry.fan_index)) {
+                return Err(crate::errors::ApiError::BadRequest(format!(
+                    "duplicate lighting effect route entry for {} fan {}",
+                    entry.device_id, entry.fan_index
+                )));
+            }
+
+            Ok(RgbEffectRouteEntry {
+                device_id: entry.device_id,
+                fan_index: entry.fan_index,
+            })
+        })
+        .collect()
+}
+
+fn legacy_device_led_zone_layout(
+    cfg: &RgbAppConfig,
+    device_id: &str,
+) -> Option<Vec<LightingLedZoneConfigDocument>> {
+    let configured_device = cfg
+        .devices
+        .iter()
+        .find(|configured_device| configured_device.device_id == device_id)?;
+    if configured_device.led_zones.is_empty() {
+        return None;
+    }
+
+    Some(document_led_zones_from_config(&configured_device.led_zones))
+}
+
+fn legacy_cluster_led_zone_layout(
+    cfg: &RgbAppConfig,
+    device_id: &str,
+) -> Option<Vec<LightingLedZoneConfigDocument>> {
+    if !cfg.global_led_zones.is_empty() {
+        return Some(document_led_zones_from_config(&cfg.global_led_zones));
+    }
+    if let Some(zones) = legacy_device_led_zone_layout(cfg, device_id) {
+        return Some(zones);
+    }
+    cfg.devices
+        .iter()
+        .find(|configured_device| !configured_device.led_zones.is_empty())
+        .map(|configured_device| document_led_zones_from_config(&configured_device.led_zones))
+}
+
+fn configured_led_zone_indexes(cfg: &RgbAppConfig, device: &DeviceInfo) -> Option<Vec<u8>> {
+    let mut zones = cfg
+        .fan_led_zones
+        .iter()
+        .filter(|configured_fan| configured_fan.device_id == device.device_id)
+        .flat_map(|configured_fan| configured_fan.zones.iter().map(|zone| zone.zone_index))
+        .collect::<Vec<_>>();
+    if zones.is_empty() {
+        let led_zones = if device_uses_cluster_rgb_zones(device) {
+            legacy_cluster_led_zone_layout(cfg, &device.device_id)?
+        } else {
+            legacy_device_led_zone_layout(cfg, &device.device_id)?
+        };
+        zones = led_zones.into_iter().map(|zone| zone.zone).collect::<Vec<_>>();
+    }
+    zones.sort_unstable();
+    zones.dedup();
+    Some(zones)
+}
+
+fn effective_zone_indexes(cfg: &RgbAppConfig, device: &DeviceInfo) -> Vec<u8> {
+    if let Some(zones) = configured_led_zone_indexes(cfg, device) {
+        return zones;
+    }
+
+    if let Some(zone_count) = device.rgb_zone_count {
+        if zone_count > 0 {
+            return (0..zone_count).collect();
+        }
+    }
+
+    let Some(configured_device) = cfg
+        .devices
+        .iter()
+        .find(|configured_device| configured_device.device_id == device.device_id)
+    else {
+        return vec![0];
     };
 
-    dev.zones
-        .iter()
-        .map(|zone| LightingZoneState {
-            zone: zone.zone_index,
-            effect: rgb_mode_name(zone.effect.mode),
-            colors: zone
-                .effect
-                .colors
-                .iter()
-                .map(|c| rgb_to_hex(*c))
-                .collect(),
-            speed: zone.effect.speed,
-            brightness_percent: brightness_to_percent(zone.effect.brightness),
-            direction: rgb_direction_name(zone.effect.direction),
-            scope: rgb_scope_name(zone.effect.scope),
+    if configured_device.zones.is_empty() {
+        vec![0]
+    } else {
+        let mut zones = configured_device
+            .zones
+            .iter()
+            .map(|zone| zone.zone_index)
+            .collect::<Vec<_>>();
+        zones.sort_unstable();
+        zones.dedup();
+        zones
+    }
+}
+
+fn device_uses_cluster_rgb_zones(device: &DeviceInfo) -> bool {
+    device.wireless_channel.is_some() && matches!(device.family, DeviceFamily::SlInf)
+}
+
+fn normalize_lighting_effect_for_device(device: &DeviceInfo, effect: &mut RgbEffect) {
+    if device_uses_cluster_rgb_zones(device) {
+        effect.scope = RgbScope::All;
+    }
+}
+
+fn prune_lighting_zones(cfg: &mut RgbAppConfig, device: &DeviceInfo) {
+    let valid_zones = effective_zone_indexes(cfg, device)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if valid_zones.is_empty() {
+        return;
+    }
+
+    let Some(configured_device) = cfg
+        .devices
+        .iter_mut()
+        .find(|configured_device| configured_device.device_id == device.device_id)
+    else {
+        return;
+    };
+
+    configured_device
+        .zones
+        .retain(|zone| valid_zones.contains(&zone.zone_index));
+    configured_device.zones.sort_by_key(|zone| zone.zone_index);
+    configured_device
+        .zones
+        .dedup_by_key(|zone| zone.zone_index);
+}
+
+fn build_lighting_zones(cfg: &RgbAppConfig, device: &DeviceInfo) -> Vec<LightingZoneState> {
+    existing_or_default_zone_indexes(cfg, device)
+        .into_iter()
+        .map(|zone_index| {
+            let mut effect = effect_for_zone(cfg, &device.device_id, zone_index);
+            normalize_lighting_effect_for_device(device, &mut effect);
+            LightingZoneState {
+                zone: zone_index,
+                effect: rgb_mode_name(effect.mode),
+                colors: effect.colors.iter().map(|color| rgb_to_hex(*color)).collect(),
+                speed: effect.speed,
+                brightness_percent: brightness_to_percent(effect.brightness),
+                direction: rgb_direction_name(effect.direction),
+                scope: rgb_scope_name(effect.scope),
+                smoothness_ms: effect.smoothness_ms,
+            }
         })
         .collect()
 }
@@ -1624,6 +3236,7 @@ fn effect_for_zone(cfg: &RgbAppConfig, device_id: &str, zone: u8) -> RgbEffect {
         brightness: 4,
         direction: RgbDirection::Clockwise,
         scope: RgbScope::All,
+        smoothness_ms: 0,
     }
 }
 
@@ -1634,6 +3247,7 @@ fn upsert_zone_effect(cfg: &mut RgbAppConfig, device_id: &str, zone: u8, effect:
             cfg.devices.push(RgbDeviceConfig {
                 device_id: device_id.to_string(),
                 mb_rgb_sync: false,
+                led_zones: Vec::new(),
                 zones: Vec::new(),
             });
             cfg.devices.last_mut().unwrap()
@@ -1698,6 +3312,148 @@ fn fan_slots_from_config(cfg: &AppConfig, device_id: &str) -> (Vec<FanSlotState>
     }
 
     (slots, update_interval)
+}
+
+fn build_fan_state_response(
+    cfg: &AppConfig,
+    telemetry: &TelemetrySnapshot,
+    device: &DeviceInfo,
+) -> FanStateResponse {
+    let (mut slots, update_interval_ms) = fan_slots_from_config(cfg, &device.device_id);
+    let mut rpms = telemetry.fan_rpms.get(&device.device_id).cloned();
+    if let Some(slot_limit) = physical_wireless_fan_limit(device) {
+        slots.truncate(slot_limit);
+        if let Some(values) = rpms.as_mut() {
+            values.truncate(slot_limit);
+        }
+    }
+    normalize_reported_manual_slots(device, &mut slots);
+    let active_mode = summarize_fan_active_mode(&slots);
+    let active_curve = summarize_fan_active_curve(&slots, &active_mode);
+    let temperature_source = active_curve.as_ref().and_then(|curve_name| {
+        cfg.fan_curves
+            .iter()
+            .find(|curve| curve.name == *curve_name)
+            .map(|curve| curve.temp_command.clone())
+    });
+    let mb_sync_enabled = slots.iter().any(|slot| slot.mode == "mb_sync");
+
+    FanStateResponse {
+        device_id: device.device_id.clone(),
+        update_interval_ms,
+        rpms,
+        slots,
+        active_mode,
+        active_curve,
+        temperature_source,
+        mb_sync_enabled,
+        start_stop_supported: false,
+        start_stop_enabled: false,
+    }
+}
+
+fn physical_wireless_fan_limit(device: &DeviceInfo) -> Option<usize> {
+    if device.wireless_channel.is_none() {
+        return None;
+    }
+
+    match device.fan_count {
+        Some(1..=4) => Some(device.fan_count.unwrap_or(0) as usize),
+        _ => None,
+    }
+}
+
+fn normalize_reported_manual_slots(device: &DeviceInfo, slots: &mut [FanSlotState]) {
+    let Some(min_percent) = stable_manual_percent_floor(device) else {
+        return;
+    };
+
+    for slot in slots {
+        if slot.mode != "manual" {
+            continue;
+        }
+        let Some(percent) = slot.percent else {
+            continue;
+        };
+        if percent == 0 || percent >= min_percent {
+            continue;
+        }
+
+        slot.percent = Some(min_percent);
+        slot.pwm = Some(percent_to_pwm(min_percent));
+    }
+}
+
+fn normalize_manual_percent_for_device(device: &DeviceInfo, percent: u8) -> u8 {
+    match stable_manual_percent_floor(device) {
+        Some(min_percent) if percent > 0 && percent < min_percent => min_percent,
+        _ => percent,
+    }
+}
+
+fn stable_manual_percent_floor(device: &DeviceInfo) -> Option<u8> {
+    if device.wireless_channel.is_some()
+        && matches!(device.family, DeviceFamily::SlInf)
+        && device.fan_count == Some(1)
+    {
+        Some(30)
+    } else {
+        None
+    }
+}
+
+fn summarize_fan_active_mode(slots: &[FanSlotState]) -> String {
+    if slots.is_empty() {
+        return "manual".to_string();
+    }
+
+    let unique_modes = slots
+        .iter()
+        .map(|slot| slot.mode.as_str())
+        .collect::<HashSet<_>>();
+
+    if unique_modes.len() == 1 {
+        unique_modes
+            .into_iter()
+            .next()
+            .unwrap_or("manual")
+            .to_string()
+    } else {
+        "mixed".to_string()
+    }
+}
+
+fn summarize_fan_active_curve(slots: &[FanSlotState], active_mode: &str) -> Option<String> {
+    if active_mode != "curve" {
+        return None;
+    }
+
+    let curve_names = slots
+        .iter()
+        .filter_map(|slot| slot.curve.as_deref())
+        .collect::<HashSet<_>>();
+
+    if curve_names.len() == 1 {
+        curve_names.into_iter().next().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+fn ensure_fan_group_mut<'a>(cfg: &'a mut FanConfig, device_id: &str) -> &'a mut FanGroup {
+    if let Some(index) = cfg
+        .speeds
+        .iter()
+        .position(|group| group.device_id.as_deref() == Some(device_id))
+    {
+        return &mut cfg.speeds[index];
+    }
+
+    cfg.speeds.push(FanGroup {
+        device_id: Some(device_id.to_string()),
+        speeds: default_fan_speeds(0),
+    });
+    cfg.speeds.last_mut().expect("fan group exists after push")
 }
 
 fn parse_color(color: &crate::models::ColorValue) -> ApiResult<[u8; 3]> {
@@ -1925,3 +3681,46 @@ impl AppConfigExt for AppConfig {
         self
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

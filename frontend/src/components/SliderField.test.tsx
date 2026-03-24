@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { SliderField } from "./SliderField";
+import { SliderField } from "./forms/SliderField";
 
 describe("SliderField", () => {
   it("shows the current value and forwards slider updates", () => {

@@ -1,14 +1,16 @@
-use anyhow::{Context, Result};
+use crate::temperature_sources;
+use anyhow::Result;
 use lianli_devices::traits::FanDevice;
-use lianli_devices::wireless::WirelessController;
+use lianli_devices::wireless::{DiscoveredDevice, WirelessController, WirelessFanType};
 use lianli_shared::fan::{FanConfig, FanCurve, FanSpeed};
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+const SL_INF_SINGLE_FAN_STABLE_MIN_DUTY_PERCENT: u8 = 30;
 
 pub struct FanController {
     config: FanConfig,
@@ -70,6 +72,7 @@ fn fan_control_thread(
 ) {
     let update_interval = Duration::from_millis(config.update_interval_ms);
     let mut last_update = Instant::now() - update_interval;
+    let mut last_applied: HashMap<String, [u8; 4]> = HashMap::new();
 
     // Wait briefly for wireless discovery if we have wireless
     if let Some(ref w) = wireless {
@@ -154,14 +157,51 @@ fn fan_control_thread(
                 if let Some(ref device_id) = group.device_id {
                     if device_id.starts_with("wireless:") {
                         if let Some(ref w) = wireless {
-                            let mac_str = device_id.strip_prefix("wireless:").unwrap_or(device_id);
-                            if let Some(dev) = w.devices().into_iter().find(|d| d.mac_str() == mac_str) {
+                            if let Some(dev) = find_wireless_device(&wireless, device_id) {
                                 if dev.fan_type.supports_hw_mobo_sync() {
                                     // SLV3: firmware reads its local PWM header
-                                    apply_wireless_by_id(&wireless, device_id, &[6, 6, 6, 6], group_idx);
+                                    let speeds = [6, 6, 6, 6];
+                                    let effective_speeds =
+                                        effective_wireless_speeds_for_id(&wireless, device_id, &speeds);
+                                    if should_apply_wireless_speeds(
+                                        &last_applied,
+                                        &wireless,
+                                        device_id,
+                                        &effective_speeds,
+                                    ) && apply_wireless_by_id(
+                                        &wireless,
+                                        device_id,
+                                        &effective_speeds,
+                                        group_idx,
+                                    ) {
+                                        remember_applied(
+                                            &mut last_applied,
+                                            device_id,
+                                            &effective_speeds,
+                                        );
+                                    }
                                 } else if let Some(pwm) = w.motherboard_pwm() {
                                     // RX dongle reports valid mobo PWM — relay it
-                                    apply_wireless_by_id(&wireless, device_id, &[pwm, pwm, pwm, pwm], group_idx);
+                                    let speeds = [pwm, pwm, pwm, pwm];
+                                    let effective_speeds =
+                                        effective_wireless_speeds_for_id(&wireless, device_id, &speeds);
+                                    if should_apply_wireless_speeds(
+                                        &last_applied,
+                                        &wireless,
+                                        device_id,
+                                        &effective_speeds,
+                                    ) && apply_wireless_by_id(
+                                        &wireless,
+                                        device_id,
+                                        &effective_speeds,
+                                        group_idx,
+                                    ) {
+                                        remember_applied(
+                                            &mut last_applied,
+                                            device_id,
+                                            &effective_speeds,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -181,19 +221,45 @@ fn fan_control_thread(
             // Try to apply to the right device
             if let Some(ref device_id) = group.device_id {
                 if device_id.starts_with("wireless:") {
-                    apply_wireless_by_id(&wireless, device_id, &speeds, group_idx);
+                    let effective_speeds =
+                        effective_wireless_speeds_for_id(&wireless, device_id, &speeds);
+                    if should_apply_wireless_speeds(
+                        &last_applied,
+                        &wireless,
+                        device_id,
+                        &effective_speeds,
+                    ) && apply_wireless_by_id(&wireless, device_id, &effective_speeds, group_idx)
+                    {
+                        remember_applied(
+                            &mut last_applied,
+                            device_id,
+                            &effective_speeds,
+                        );
+                    }
                 } else if let Some((base_id, port_str)) = device_id.rsplit_once(":port") {
                     // Per-port wired device (e.g. "Nuvoton:port0")
                     if let (Some(dev), Ok(port)) = (wired.get(base_id), port_str.parse::<u8>()) {
+                        if !should_apply_speeds(&last_applied, device_id, &speeds) {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
                         if let Err(err) = dev.set_fan_speed(port, speeds[0]) {
                             warn!("Failed to set fan speed for {device_id}: {err}");
+                        } else {
+                            remember_applied(&mut last_applied, device_id, &speeds);
                         }
                     } else {
                         warn!("Fan group {group_idx}: device '{device_id}' not found");
                     }
                 } else if let Some(dev) = wired.get(device_id) {
+                    if !should_apply_speeds(&last_applied, device_id, &speeds) {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     if let Err(err) = dev.set_fan_speeds(&speeds) {
                         warn!("Failed to set fan speeds for {device_id}: {err}");
+                    } else {
+                        remember_applied(&mut last_applied, device_id, &speeds);
                     }
                 } else {
                     warn!("Fan group {group_idx}: device '{device_id}' not found");
@@ -201,8 +267,15 @@ fn fan_control_thread(
             } else {
                 // Legacy: match by group index to wireless devices
                 if let Some(ref w) = wireless {
+                    let legacy_key = format!("wireless-group:{group_idx}");
+                    if !should_apply_speeds(&last_applied, &legacy_key, &speeds) {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     if let Err(err) = w.set_fan_speeds(group_idx as u8, &speeds) {
                         warn!("Failed to set fan speeds for wireless device {group_idx}: {err}");
+                    } else {
+                        remember_applied(&mut last_applied, &legacy_key, &speeds);
                     }
                 }
             }
@@ -221,21 +294,116 @@ fn apply_wireless_by_id(
     device_id: &str,
     speeds: &[u8; 4],
     group_idx: usize,
-) {
+) -> bool {
     let Some(w) = wireless else {
         warn!("Fan group {group_idx}: wireless not available for device {device_id}");
-        return;
+        return false;
     };
-    // Extract MAC from "wireless:AA:BB:CC:DD:EE:FF"
-    let mac_str = device_id.strip_prefix("wireless:").unwrap_or(device_id);
-    // Find the device by MAC and get its list_index
-    let devices = w.devices();
-    if let Some(dev) = devices.iter().find(|d| d.mac_str() == mac_str) {
+    if let Some(dev) = find_wireless_device(wireless, device_id) {
         if let Err(err) = w.set_fan_speeds(dev.list_index, speeds) {
             warn!("Failed to set fan speeds for {device_id}: {err}");
+            false
+        } else {
+            true
         }
     } else {
-        warn!("Fan group {group_idx}: wireless device {device_id} not discovered");
+        debug!("Fan group {group_idx}: wireless device {device_id} is not connected");
+        false
+    }
+}
+
+fn should_apply_speeds(
+    last_applied: &HashMap<String, [u8; 4]>,
+    target_id: &str,
+    speeds: &[u8; 4],
+) -> bool {
+    last_applied.get(target_id) != Some(speeds)
+}
+
+fn remember_applied(
+    last_applied: &mut HashMap<String, [u8; 4]>,
+    target_id: &str,
+    speeds: &[u8; 4],
+) {
+    last_applied.insert(target_id.to_string(), *speeds);
+}
+
+fn find_wireless_device(
+    wireless: &Option<Arc<WirelessController>>,
+    device_id: &str,
+) -> Option<DiscoveredDevice> {
+    let w = wireless.as_ref()?;
+    let master_mac = w.master_mac();
+    let mac_str = device_id.strip_prefix("wireless:").unwrap_or(device_id);
+    w.devices()
+        .into_iter()
+        .find(|device| {
+            device.mac_str() == mac_str
+                && !w.is_locally_detached(&device.mac)
+                && !device.master_mac.iter().all(|&byte| byte == 0)
+                && device.master_mac == master_mac
+        })
+}
+
+fn effective_wireless_speeds_for_id(
+    wireless: &Option<Arc<WirelessController>>,
+    device_id: &str,
+    speeds: &[u8; 4],
+) -> [u8; 4] {
+    find_wireless_device(wireless, device_id)
+        .map(|device| normalize_wireless_speeds(&device, speeds))
+        .unwrap_or(*speeds)
+}
+
+fn should_apply_wireless_speeds(
+    last_applied: &HashMap<String, [u8; 4]>,
+    wireless: &Option<Arc<WirelessController>>,
+    device_id: &str,
+    speeds: &[u8; 4],
+) -> bool {
+    let Some(device) = find_wireless_device(wireless, device_id) else {
+        return false;
+    };
+
+    if last_applied.get(device_id) != Some(speeds) {
+        return true;
+    }
+
+    device.current_pwm != *speeds
+}
+
+fn normalize_wireless_speeds(device: &DiscoveredDevice, speeds: &[u8; 4]) -> [u8; 4] {
+    let mut normalized = *speeds;
+    let min_pwm = ((stable_min_duty_percent(device) as f32 / 100.0) * 255.0) as u8;
+
+    for (index, value) in normalized.iter_mut().enumerate() {
+        if index as u8 >= device.fan_count {
+            *value = 0;
+            continue;
+        }
+
+        if *value > 0 && *value < min_pwm {
+            *value = min_pwm;
+        }
+
+        if device.fan_type == WirelessFanType::Clv1 {
+            match *value {
+                153 | 154 => *value = 152,
+                155 => *value = 156,
+                _ => {}
+            }
+        }
+    }
+
+    normalized
+}
+
+fn stable_min_duty_percent(device: &DiscoveredDevice) -> u8 {
+    match (device.fan_type, device.fan_count) {
+        (WirelessFanType::SlInf, 1) => {
+            SL_INF_SINGLE_FAN_STABLE_MIN_DUTY_PERCENT.max(device.fan_type.min_duty_percent())
+        }
+        _ => device.fan_type.min_duty_percent(),
     }
 }
 
@@ -253,7 +421,7 @@ fn calculate_fan_speeds(
                     .get(curve_name)
                     .ok_or_else(|| anyhow::anyhow!("Curve '{curve_name}' not found"))?;
 
-                let temp = read_temperature(&curve.temp_command)?;
+                let temp = temperature_sources::read_temperature(&curve.temp_command)?;
                 let speed_percent = interpolate_curve(&curve.curve, temp);
                 let pwm = (speed_percent * 2.55) as u8;
 
@@ -264,30 +432,6 @@ fn calculate_fan_speeds(
     }
 
     Ok(pwm_values)
-}
-
-fn read_temperature(command: &str) -> Result<f32> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .context("executing temperature command")?;
-
-    if !output.status.success() {
-        anyhow::bail!("temperature command failed with status {}", output.status);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let temp_str = stdout.split_whitespace().next().unwrap_or("0");
-    let temp = temp_str
-        .parse::<f32>()
-        .with_context(|| format!("parsing temperature value '{temp_str}'"))?;
-
-    if !temp.is_finite() {
-        anyhow::bail!("temperature value '{temp}' is not finite");
-    }
-
-    Ok(temp)
 }
 
 fn interpolate_curve(curve: &[(f32, f32)], temp: f32) -> f32 {

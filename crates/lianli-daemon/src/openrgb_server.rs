@@ -6,6 +6,7 @@
 
 use crate::rgb_controller::{DirectColorBuffer, RgbController};
 use lianli_shared::rgb::{RgbDeviceCapabilities, RgbDirection, RgbEffect, RgbMode};
+use lianli_shared::rgb::MAX_EFFECT_SPEED;
 use parking_lot::Mutex;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -530,8 +531,8 @@ impl ClientHandler {
             _ => RgbDirection::Clockwise,
         };
 
-        // Scale speed: OpenRGB 0..4 maps to our 0..4
-        let spd = (speed as u8).min(4);
+        // Scale speed: OpenRGB speed maps to our 0..MAX_EFFECT_SPEED range.
+        let spd = (speed as u8).min(MAX_EFFECT_SPEED);
         let bri = (brightness as u8).min(4);
 
         Some(RgbEffect {
@@ -670,7 +671,7 @@ impl ClientHandler {
                 colors_min,
                 colors_max,
                 0,    // speed_min
-                4,    // speed_max
+                MAX_EFFECT_SPEED as u32, // speed_max
                 2,    // default speed
                 4,    // default brightness
             ));

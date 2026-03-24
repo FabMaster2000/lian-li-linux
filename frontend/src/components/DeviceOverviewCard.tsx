@@ -1,4 +1,4 @@
-import { DeviceCard } from "./DeviceCard";
+import { DeviceCard } from "./devices/DeviceCard";
 import type { DeviceView } from "../types/api";
 
 type DeviceOverviewCardProps = {

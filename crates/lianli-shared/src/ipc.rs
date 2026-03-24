@@ -11,6 +11,13 @@ use std::collections::HashMap;
 pub enum IpcRequest {
     ListDevices,
     GetConfig,
+    RefreshWirelessDiscovery,
+    BindWirelessDevice {
+        device_id: String,
+    },
+    UnbindWirelessDevice {
+        device_id: String,
+    },
     /// Replace the entire config (daemon writes to disk + reloads).
     SetConfig {
         config: AppConfig,
@@ -25,6 +32,9 @@ pub enum IpcRequest {
     },
     SetFanConfig {
         config: FanConfig,
+    },
+    PreviewFanTemperature {
+        source: String,
     },
     GetTelemetry,
     /// Get RGB capabilities for all devices.
@@ -41,6 +51,13 @@ pub enum IpcRequest {
         zone: u8,
         /// RGB triplets, one per LED.
         colors: Vec<[u8; 3]>,
+    },
+    /// Light a single physical LED on a selected fan for mapping / probing.
+    ProbeRgbLed {
+        device_id: String,
+        fan_index: u8,
+        led_index: u16,
+        color: [u8; 3],
     },
     /// Enable/disable motherboard ARGB sync for a device.
     SetMbRgbSync {
@@ -60,6 +77,29 @@ pub enum IpcRequest {
     },
     Subscribe,
     Ping,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanTemperaturePreview {
+    pub source: String,
+    pub display_name: String,
+    pub available: bool,
+    pub celsius: Option<f32>,
+    #[serde(default)]
+    pub components: Vec<FanTemperatureComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanTemperatureComponent {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub available: bool,
+    pub celsius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Responses from daemon to GUI.
@@ -105,6 +145,14 @@ pub enum IpcEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WirelessBindingState {
+    Connected,
+    Available,
+    Foreign,
+}
+
 /// Info about a connected device, returned by ListDevices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -112,6 +160,13 @@ pub struct DeviceInfo {
     pub family: DeviceFamily,
     pub name: String,
     pub serial: Option<String>,
+    pub wireless_channel: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireless_missed_polls: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireless_master_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireless_binding_state: Option<WirelessBindingState>,
     pub has_lcd: bool,
     pub has_fan: bool,
     pub has_pump: bool,

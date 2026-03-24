@@ -1,45 +1,37 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 import { useBackendEvents } from "./BackendEventsProvider";
+import { useSystemStatus } from "./SystemStatusProvider";
 import { GlobalSystemNotices } from "../components/GlobalSystemNotices";
-import { primaryNavigation } from "./navigation";
+import { AppShell } from "../components/layout/AppShell";
+import { SidebarNav } from "../components/layout/SidebarNav";
+import { TopBar } from "../components/layout/TopBar";
+import { navigationItemForPath, primaryNavigation } from "./navigation";
 
 export function AppLayout() {
+  const location = useLocation();
   const { connectionState } = useBackendEvents();
+  const { apiReachable, daemonStatus } = useSystemStatus();
+  const currentSection = navigationItemForPath(location.pathname);
 
   return (
-    <div className="app-frame">
-      <aside className="app-sidebar">
-        <div className="brand-panel">
-          <p className="brand-panel__eyebrow">Lian Li Linux</p>
-          <h1>Control Surface</h1>
-          <p>
-            A web operator panel for lighting, cooling, profiles, and daemon
-            visibility.
-          </p>
-          <small className="brand-panel__status">Live events: {connectionState}</small>
-        </div>
-
-        <nav className="app-nav" aria-label="Primary">
-          {primaryNavigation.map((item) => (
-            <NavLink
-              key={item.to}
-              className={({ isActive }) =>
-                isActive ? "app-nav__link app-nav__link--active" : "app-nav__link"
-              }
-              end={item.to === "/"}
-              to={item.to}
-            >
-              <span className="app-nav__eyebrow">{item.eyebrow}</span>
-              <span className="app-nav__label">{item.label}</span>
-            </NavLink>
-          ))}
-        </nav>
-      </aside>
-
+    <AppShell
+      sidebar={
+        <SidebarNav eventConnectionState={connectionState} items={primaryNavigation} />
+      }
+      topBar={
+        <TopBar
+          apiReachable={apiReachable}
+          connectionState={connectionState}
+          daemonReachable={daemonStatus?.reachable ?? null}
+          sectionDescription={currentSection.description}
+          sectionLabel={currentSection.label}
+        />
+      }
+    >
       <div className="app-main">
         <GlobalSystemNotices />
         <Outlet />
       </div>
-    </div>
+    </AppShell>
   );
 }

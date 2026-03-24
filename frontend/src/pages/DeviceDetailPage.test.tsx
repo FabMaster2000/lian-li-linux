@@ -6,6 +6,7 @@ import type {
   DeviceView,
   FanStateResponse,
   LightingStateResponse,
+  ProfileDocument,
 } from "../types/api";
 import { useDeviceDetailData } from "../hooks/useDeviceDetailData";
 
@@ -19,6 +20,28 @@ function device(overrides: Partial<DeviceView> = {}): DeviceView {
   return {
     id: "wireless:one",
     name: "Controller One",
+    display_name: "Controller One",
+    ui_order: 10,
+    physical_role: "Wireless cluster",
+    capability_summary: "1 RGB zone(s) | 4 fan slot(s)",
+    current_mode_summary: "Lighting ready | Cooling telemetry live",
+    controller: {
+      id: "wireless:mesh",
+      label: "Wireless mesh",
+      kind: "wireless_mesh",
+    },
+    wireless: {
+      transport: "wireless",
+      channel: 8,
+      group_id: "wireless:one",
+      group_label: "Controller One",
+    binding_state: "connected",
+    master_mac: "3b:59:87:e5:66:e4",
+    },
+    health: {
+      level: "healthy",
+      summary: "Device inventory healthy",
+    },
     family: "SlInf",
     online: true,
     capabilities: {
@@ -52,6 +75,7 @@ function lightingState(): LightingStateResponse {
         brightness_percent: 75,
         direction: "Clockwise",
         scope: "All",
+        smoothness_ms: 0,
       },
     ],
   };
@@ -71,22 +95,40 @@ function fanState(): FanStateResponse {
   };
 }
 
+function profile(): ProfileDocument {
+  return {
+    id: "night-mode",
+    name: "Night Mode",
+    description: "Dim the desk fans",
+    targets: {
+      mode: "devices",
+      device_ids: ["wireless:one"],
+    },
+    metadata: {
+      created_at: "2026-03-14T10:00:00Z",
+      updated_at: "2026-03-14T10:00:00Z",
+    },
+  };
+}
+
 describe("DeviceDetailPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("renders general, lighting, and fan sections from device detail data", () => {
+  it("renders topology, capability, profile, lighting, and fan sections", () => {
     useDeviceDetailDataMock.mockReturnValue({
       deviceId: "wireless:one",
       device: device(),
       lightingState: lightingState(),
       fanState: fanState(),
+      profiles: [profile()],
       loading: false,
       refreshing: false,
       error: null,
       lightingError: null,
       fanError: null,
+      profileError: null,
       refresh: vi.fn(),
     });
 
@@ -95,9 +137,12 @@ describe("DeviceDetailPage", () => {
       routePath: "/devices/:deviceId",
     });
 
-    expect(screen.getByText("General information")).toBeInTheDocument();
-    expect(screen.getByText("Current lighting state")).toBeInTheDocument();
-    expect(screen.getByText("Current fan state")).toBeInTheDocument();
+    expect(screen.getByText("Identity")).toBeInTheDocument();
+    expect(screen.getByText("Controller and wireless context")).toBeInTheDocument();
+    expect(screen.getByText("Current lighting summary")).toBeInTheDocument();
+    expect(screen.getByText("Current fan summary")).toBeInTheDocument();
+    expect(screen.getByText("Assigned profiles")).toBeInTheDocument();
+    expect(screen.getByText("Night Mode")).toBeInTheDocument();
     expect(screen.getByText("#112233")).toBeInTheDocument();
     expect(screen.getByText("1000 ms")).toBeInTheDocument();
   });
@@ -108,11 +153,13 @@ describe("DeviceDetailPage", () => {
       device: null,
       lightingState: null,
       fanState: null,
+      profiles: [],
       loading: false,
       refreshing: false,
       error: "not found: unknown device id",
       lightingError: null,
       fanError: null,
+      profileError: null,
       refresh: vi.fn(),
     });
 
@@ -125,17 +172,19 @@ describe("DeviceDetailPage", () => {
     expect(screen.getByText("not found: unknown device id")).toBeInTheDocument();
   });
 
-  it("shows an offline banner when the device is reported offline", () => {
+  it("surfaces profile loading warnings separately", () => {
     useDeviceDetailDataMock.mockReturnValue({
       deviceId: "wireless:one",
-      device: device({ online: false }),
+      device: device(),
       lightingState: lightingState(),
       fanState: fanState(),
+      profiles: [],
       loading: false,
       refreshing: false,
       error: null,
       lightingError: null,
       fanError: null,
+      profileError: "profile assignments unavailable",
       refresh: vi.fn(),
     });
 
@@ -144,11 +193,9 @@ describe("DeviceDetailPage", () => {
       routePath: "/devices/:deviceId",
     });
 
-    expect(screen.getByText("Device offline.")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "The last reported snapshot may be stale until the controller comes back online.",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Profiles unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("profile assignments unavailable")).toBeInTheDocument();
   });
 });
+
+

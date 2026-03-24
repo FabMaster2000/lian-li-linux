@@ -66,6 +66,7 @@ describe("apiClient", () => {
       "http://localhost:3000/api/health?device=wireless%3Aone&zone=0&zone=1&verbose=true",
       expect.objectContaining({
         method: "GET",
+        cache: "no-store",
       }),
     );
   });

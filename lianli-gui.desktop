@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Lian Li Linux
-Comment=Fan control, LCD streaming, and sensor gauges for Lian Li devices
-Exec=lianli-gui
-Icon=lianli-gui
-Terminal=false
-Type=Application
-Categories=Utility;HardwareSettings;
-StartupWMClass=com.sgtaziz.lianlilinux

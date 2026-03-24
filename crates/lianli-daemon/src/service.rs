@@ -2,6 +2,7 @@ use crate::fan_controller::FanController;
 use crate::ipc_server::{self, DaemonState};
 use crate::openrgb_server;
 use crate::rgb_controller::RgbController;
+use crate::wireless_inventory::build_wireless_inventory;
 use anyhow::Result;
 use lianli_devices::crypto::PacketBuilder;
 use lianli_devices::detect::{
@@ -275,6 +276,10 @@ impl ServiceManager {
                         family: det.family,
                         name: det.name.to_string(),
                         serial: Some(device_id),
+                        wireless_channel: None,
+                        wireless_missed_polls: None,
+                        wireless_master_mac: None,
+                        wireless_binding_state: None,
                         has_lcd: det.family.has_lcd(),
                         has_fan: det.family.has_fan(),
                         has_pump: det.family.has_pump(),
@@ -315,53 +320,14 @@ impl ServiceManager {
             port: orgb_state.port,
             error: orgb_state.error.clone(),
         };
+        ipc_state
+            .telemetry
+            .fan_rpms
+            .retain(|device_id, _| !device_id.starts_with("wireless:"));
 
         // Build device list from wireless discovery
-        let mut devices = Vec::new();
-        for dev in self.wireless.devices() {
-            let family = match dev.fan_type {
-                lianli_devices::wireless::WirelessFanType::Slv3Led => {
-                    lianli_shared::device_id::DeviceFamily::Slv3Led
-                }
-                lianli_devices::wireless::WirelessFanType::Slv3Lcd => {
-                    lianli_shared::device_id::DeviceFamily::Slv3Lcd
-                }
-                lianli_devices::wireless::WirelessFanType::Tlv2Lcd => {
-                    lianli_shared::device_id::DeviceFamily::Tlv2Lcd
-                }
-                lianli_devices::wireless::WirelessFanType::Tlv2Led => {
-                    lianli_shared::device_id::DeviceFamily::Tlv2Led
-                }
-                lianli_devices::wireless::WirelessFanType::SlInf => {
-                    lianli_shared::device_id::DeviceFamily::SlInf
-                }
-                lianli_devices::wireless::WirelessFanType::Clv1 => {
-                    lianli_shared::device_id::DeviceFamily::Clv1
-                }
-                lianli_devices::wireless::WirelessFanType::Unknown => {
-                    lianli_shared::device_id::DeviceFamily::Slv3Led
-                }
-            };
-            devices.push(DeviceInfo {
-                device_id: format!("wireless:{}", dev.mac_str()),
-                family,
-                name: dev.fan_type.display_name().to_string(),
-                serial: Some(dev.mac_str()),
-                has_lcd: false, // LCD streaming uses USB bulk, not wireless
-                has_fan: dev.fan_count > 0,
-                has_pump: false,
-                has_rgb: true, // All wireless fans have RGB LEDs
-                fan_count: Some(dev.fan_count),
-                per_fan_control: Some(true),
-                mb_sync_support: dev.fan_type.supports_hw_mobo_sync() || self.wireless.motherboard_pwm().is_some(),
-                rgb_zone_count: Some(dev.fan_count), // One zone per fan
-                screen_width: None,
-                screen_height: None,
-            });
-
-            // Update RPM telemetry keyed by device_id
-            let device_id = format!("wireless:{}", dev.mac_str());
-            let rpms: Vec<u16> = dev.fan_rpms[..dev.fan_count as usize].to_vec();
+        let (mut devices, wireless_telemetry) = build_wireless_inventory(&self.wireless);
+        for (device_id, rpms) in wireless_telemetry {
             ipc_state.telemetry.fan_rpms.insert(device_id, rpms);
         }
 
@@ -407,7 +373,11 @@ impl ServiceManager {
 
         // Drop RGB controller before HID backends so device handles are released cleanly
         self.rgb_controller = None;
-        self.ipc_state.lock().rgb_controller = None;
+        {
+            let mut ipc_state = self.ipc_state.lock();
+            ipc_state.rgb_controller = None;
+            ipc_state.wireless_controller = None;
+        }
         self.wired_fan_devices = Arc::new(HashMap::new());
         self.hid_backends.clear();
 
@@ -570,6 +540,10 @@ impl ServiceManager {
                             family,
                             name: dev_name,
                             serial: serial.map(|s| s.to_string()),
+                            wireless_channel: None,
+                            wireless_missed_polls: None,
+                            wireless_master_mac: None,
+                            wireless_binding_state: None,
                             has_lcd: false,
                             has_fan: true,
                             has_pump: false,
@@ -692,15 +666,16 @@ impl ServiceManager {
     fn try_wireless(&mut self) {
         match self.wireless.connect() {
             Ok(()) => {
+                self.ipc_state.lock().wireless_controller = Some(self.wireless.clone());
                 match self.wireless.start_polling() {
                     Ok(()) => {
-                        let _ = self.wireless.send_rx_sequence();
                         info!("Wireless links active");
                     }
                     Err(err) => warn!("[wireless] polling start failed: {err}"),
                 }
             }
             Err(_) => {
+                self.ipc_state.lock().wireless_controller = None;
                 debug!("[wireless] no TX/RX devices found, skipping wireless");
             }
         }

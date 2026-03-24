@@ -6,10 +6,12 @@ import type {
   DeviceView,
   FanStateResponse,
   LightingStateResponse,
+  ProfileDocument,
 } from "../types/api";
 import { getDevice } from "../services/devices";
 import { getFanState } from "../services/fans";
 import { getLightingState } from "../services/lighting";
+import { listProfiles } from "../services/profiles";
 
 vi.mock("../services/devices", () => ({
   getDevice: vi.fn(),
@@ -23,6 +25,10 @@ vi.mock("../services/lighting", () => ({
   getLightingState: vi.fn(),
 }));
 
+vi.mock("../services/profiles", () => ({
+  listProfiles: vi.fn(),
+}));
+
 let latestBackendListener: ((event: BackendEventEnvelope) => void) | null = null;
 
 vi.mock("./useBackendEventSubscription", () => ({
@@ -34,6 +40,7 @@ vi.mock("./useBackendEventSubscription", () => ({
 const getDeviceMock = vi.mocked(getDevice);
 const getFanStateMock = vi.mocked(getFanState);
 const getLightingStateMock = vi.mocked(getLightingState);
+const listProfilesMock = vi.mocked(listProfiles);
 
 function emitBackendEvent(event: Partial<BackendEventEnvelope> & Pick<BackendEventEnvelope, "type">) {
   latestBackendListener?.({
@@ -49,6 +56,28 @@ function device(overrides: Partial<DeviceView> = {}): DeviceView {
   return {
     id: "wireless:one",
     name: "Controller One",
+    display_name: "Controller One",
+    ui_order: 10,
+    physical_role: "Wireless cluster",
+    capability_summary: "1 RGB zone(s) | 4 fan slot(s)",
+    current_mode_summary: "Lighting ready | Cooling telemetry live",
+    controller: {
+      id: "wireless:mesh",
+      label: "Wireless mesh",
+      kind: "wireless_mesh",
+    },
+    wireless: {
+      transport: "wireless",
+      channel: 8,
+      group_id: "wireless:one",
+      group_label: "Controller One",
+    binding_state: "connected",
+    master_mac: "3b:59:87:e5:66:e4",
+    },
+    health: {
+      level: "healthy",
+      summary: "Device inventory healthy",
+    },
     family: "SlInf",
     online: true,
     capabilities: {
@@ -70,9 +99,7 @@ function device(overrides: Partial<DeviceView> = {}): DeviceView {
   };
 }
 
-function lightingState(
-  effect = "Static",
-): LightingStateResponse {
+function lightingState(effect = "Static"): LightingStateResponse {
   return {
     device_id: "wireless:one",
     zones: [
@@ -84,6 +111,7 @@ function lightingState(
         brightness_percent: 75,
         direction: "Clockwise",
         scope: "All",
+        smoothness_ms: 0,
       },
     ],
   };
@@ -103,13 +131,30 @@ function fanState(percent = 50): FanStateResponse {
   };
 }
 
+function profile(): ProfileDocument {
+  return {
+    id: "night-mode",
+    name: "Night Mode",
+    description: "Dim the desk fans",
+    targets: {
+      mode: "devices",
+      device_ids: ["wireless:one"],
+    },
+    metadata: {
+      created_at: "2026-03-14T10:00:00Z",
+      updated_at: "2026-03-14T10:00:00Z",
+    },
+  };
+}
+
 describe("useDeviceDetailData", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     latestBackendListener = null;
+    listProfilesMock.mockResolvedValue([profile()]);
   });
 
-  it("loads device, lighting, and fan data and decodes the route device id", async () => {
+  it("loads device, lighting, fan, and profile data and decodes the route device id", async () => {
     getDeviceMock.mockResolvedValue(device());
     getLightingStateMock.mockResolvedValue(lightingState());
     getFanStateMock.mockResolvedValue(fanState());
@@ -122,6 +167,7 @@ describe("useDeviceDetailData", () => {
     expect(result.current.device?.name).toBe("Controller One");
     expect(result.current.lightingState?.zones[0]?.effect).toBe("Static");
     expect(result.current.fanState?.slots[0]?.percent).toBe(50);
+    expect(result.current.profiles).toHaveLength(1);
     expect(result.current.error).toBeNull();
   });
 
@@ -138,19 +184,23 @@ describe("useDeviceDetailData", () => {
     expect(result.current.error).toBeNull();
     expect(result.current.lightingError).toBe("lighting backend unavailable");
     expect(result.current.fanError).toBeNull();
+    expect(result.current.profileError).toBeNull();
     expect(result.current.fanState?.slots[0]?.percent).toBe(50);
   });
 
   it("refreshes the snapshot in the background when a matching backend event arrives", async () => {
     getDeviceMock
       .mockResolvedValueOnce(device())
-      .mockResolvedValueOnce(device({ state: { fan_rpms: [950, 960, 970, 980], coolant_temp: 32.0, streaming_active: true } }));
+      .mockResolvedValueOnce(
+        device({
+          state: { fan_rpms: [950, 960, 970, 980], coolant_temp: 32, streaming_active: true },
+        }),
+      );
     getLightingStateMock
       .mockResolvedValueOnce(lightingState("Static"))
       .mockResolvedValueOnce(lightingState("Rainbow"));
-    getFanStateMock
-      .mockResolvedValueOnce(fanState(50))
-      .mockResolvedValueOnce(fanState(65));
+    getFanStateMock.mockResolvedValueOnce(fanState(50)).mockResolvedValueOnce(fanState(65));
+    listProfilesMock.mockResolvedValueOnce([profile()]).mockResolvedValueOnce([profile()]);
 
     const { result } = renderHook(() => useDeviceDetailData("wireless%3Aone"));
     await waitFor(() => expect(result.current.lightingState?.zones[0]?.effect).toBe("Static"));
@@ -165,5 +215,8 @@ describe("useDeviceDetailData", () => {
     await waitFor(() => expect(result.current.lightingState?.zones[0]?.effect).toBe("Rainbow"));
     expect(result.current.fanState?.slots[0]?.percent).toBe(65);
     expect(getDeviceMock).toHaveBeenCalledTimes(2);
+    expect(listProfilesMock).toHaveBeenCalledTimes(2);
   });
 });
+
+

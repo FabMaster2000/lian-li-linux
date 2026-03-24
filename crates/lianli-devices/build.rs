@@ -1,4 +1,5 @@
-/// Build script: compiles the vendored tinyuz C++ library for wireless RGB compression.
+/// Build script: compiles the vendored tinyuz C++ library for wireless RGB compression
+/// and the C decompression library for capture analysis.
 fn main() {
     let vendor = std::path::Path::new("../../vendor");
     let tinyuz = vendor.join("tinyuz");
@@ -34,7 +35,18 @@ fn main() {
 
     build.compile("tinyuz");
 
+    // Compile tinyuz decompression (pure C) as a separate static library
+    cc::Build::new()
+        .file(tinyuz.join("decompress/tuz_dec.c"))
+        .opt_level(3)
+        .define("NDEBUG", None)
+        .include(vendor)
+        .include(&tinyuz)
+        .warnings(false)
+        .compile("tinyuz_dec");
+
     // Re-run if vendor sources change
     println!("cargo:rerun-if-changed=../../vendor/tuz_wrapper.cpp");
     println!("cargo:rerun-if-changed=../../vendor/tinyuz/compress/");
+    println!("cargo:rerun-if-changed=../../vendor/tinyuz/decompress/");
 }

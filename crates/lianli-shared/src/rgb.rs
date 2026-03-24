@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const MAX_EFFECT_SPEED: u8 = 20;
+
 /// Supported RGB effect modes.
 ///
 /// These map to hardware-native modes for wired devices (TL Fan, ENE 6K77, Galahad2).
@@ -209,7 +211,7 @@ pub struct RgbEffect {
     /// Up to 4 RGB colors.
     #[serde(default)]
     pub colors: Vec<[u8; 3]>,
-    /// Speed: 0-4 (slowest to fastest).
+    /// Speed: 0-20 (slowest to fastest).
     #[serde(default = "default_speed")]
     pub speed: u8,
     /// Brightness: 0-4 (dimmest to brightest).
@@ -221,6 +223,10 @@ pub struct RgbEffect {
     /// Which LED scope to target (All, Top, Bottom, Inner, Outer).
     #[serde(default)]
     pub scope: RgbScope,
+    /// Meteor trail smoothness: 0-3000 ms (wider trail = smoother fade).
+    /// Only used for Meteor / MeteorShower effects.
+    #[serde(default)]
+    pub smoothness_ms: u16,
 }
 
 fn default_speed() -> u8 {
@@ -240,6 +246,7 @@ impl Default for RgbEffect {
             brightness: default_brightness(),
             direction: RgbDirection::default(),
             scope: RgbScope::default(),
+            smoothness_ms: 0,
         }
     }
 }
@@ -257,6 +264,30 @@ pub struct RgbZoneConfig {
     pub swap_tb: bool,
 }
 
+/// Ordered per-fan LED assignments for a logical RGB zone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RgbLedZoneConfig {
+    pub zone_index: u8,
+    #[serde(default)]
+    pub led_indexes: Vec<u8>,
+}
+
+/// Stored LED zone layout for one selected fan slot inside a device/cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RgbFanLedZoneConfig {
+    pub device_id: String,
+    pub fan_index: u8,
+    #[serde(default)]
+    pub zones: Vec<RgbLedZoneConfig>,
+}
+
+/// Global fan-slot route used by route-aware wireless RGB effects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RgbEffectRouteEntry {
+    pub device_id: String,
+    pub fan_index: u8,
+}
+
 /// Per-device RGB configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RgbDeviceConfig {
@@ -264,6 +295,8 @@ pub struct RgbDeviceConfig {
     /// Use motherboard ARGB header instead of software-controlled effects.
     #[serde(default)]
     pub mb_rgb_sync: bool,
+    #[serde(default)]
+    pub led_zones: Vec<RgbLedZoneConfig>,
     pub zones: Vec<RgbZoneConfig>,
 }
 
@@ -279,6 +312,15 @@ pub struct RgbAppConfig {
     /// OpenRGB SDK server port.
     #[serde(default = "default_openrgb_port")]
     pub openrgb_port: u16,
+    /// Global per-fan LED assignments for logical RGB zones.
+    #[serde(default)]
+    pub global_led_zones: Vec<RgbLedZoneConfig>,
+    /// Global per-fan zone layouts keyed by device and fan slot.
+    #[serde(default)]
+    pub fan_led_zones: Vec<RgbFanLedZoneConfig>,
+    /// Global fan route for route-aware effects like Meteor and Wave.
+    #[serde(default)]
+    pub effect_route: Vec<RgbEffectRouteEntry>,
     /// Per-device RGB settings.
     #[serde(default)]
     pub devices: Vec<RgbDeviceConfig>,
@@ -298,6 +340,9 @@ impl Default for RgbAppConfig {
             enabled: true,
             openrgb_server: false,
             openrgb_port: default_openrgb_port(),
+            global_led_zones: Vec::new(),
+            fan_led_zones: Vec::new(),
+            effect_route: Vec::new(),
             devices: Vec::new(),
         }
     }

@@ -1,0 +1,63 @@
+services:
+  daemon:
+    build:
+      context: ../..
+      dockerfile: docker/runtime.Dockerfile
+    image: lianli-linux-runtime:local
+    restart: unless-stopped
+    command:
+      - sh
+      - -lc
+      - mkdir -p /runtime /data/lianli && exec lianli-daemon --config /data/lianli/config.json
+    environment:
+      XDG_RUNTIME_DIR: /runtime
+      RUST_LOG: ${DAEMON_LOG_LEVEL:-info}
+    volumes:
+      - daemon-runtime:/runtime
+      - ./state:/data
+      - type: bind
+        source: /dev/bus/usb
+        target: /dev/bus/usb
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /runtime/lianli-daemon.sock"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: docker/runtime.Dockerfile
+    image: lianli-linux-runtime:local
+    restart: unless-stopped
+    depends_on:
+      daemon:
+        condition: service_healthy
+    command:
+      - lianli-backend
+    environment:
+      LIANLI_BACKEND_CONFIG: /config/backend.json
+      LIANLI_BACKEND_LOG_LEVEL: ${BACKEND_LOG_LEVEL:-info}
+      LIANLI_BACKEND_AUTH_MODE: ${BACKEND_AUTH_MODE:-none}
+      LIANLI_BACKEND_AUTH_USERNAME: ${BACKEND_AUTH_USERNAME:-}
+      LIANLI_BACKEND_AUTH_PASSWORD: ${BACKEND_AUTH_PASSWORD:-}
+      LIANLI_BACKEND_AUTH_TOKEN: ${BACKEND_AUTH_TOKEN:-}
+      LIANLI_BACKEND_AUTH_PROXY_HEADER: ${BACKEND_AUTH_PROXY_HEADER:-x-forwarded-user}
+    volumes:
+      - daemon-runtime:/runtime
+      - ./state:/data
+      - ./backend.json:/config/backend.json:ro
+    ports:
+      - "${BACKEND_PUBLISH_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/api/health > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  daemon-runtime:

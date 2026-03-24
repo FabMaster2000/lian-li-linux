@@ -1,7 +1,9 @@
-import { ColorField } from "../components/ColorField";
-import { EffectSelect } from "../components/EffectSelect";
+import { ActionBar } from "../components/feedback/ActionBar";
+import { ColorField } from "../components/forms/ColorField";
+import { EffectSelect } from "../components/forms/EffectSelect";
 import { PageIntro } from "../components/PageIntro";
-import { SliderField } from "../components/SliderField";
+import { SliderField } from "../components/forms/SliderField";
+import { StatTile } from "../components/ui/StatTile";
 import { lightingEffectOptions } from "../features/lighting";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useProfilesWorkbenchData } from "../hooks/useProfilesWorkbenchData";
@@ -69,6 +71,26 @@ export function ProfilesPage() {
           </div>
         }
       />
+
+      <section className="summary-strip">
+        <StatTile
+          detail="Profiles currently stored in the backend library."
+          label="Profiles"
+          tone="accent"
+          value={loading ? "loading" : String(profiles.length)}
+        />
+        <StatTile
+          detail="Current live inventory available as profile targets."
+          label="Target devices"
+          value={loading ? "loading" : String(devices.length)}
+        />
+        <StatTile
+          detail="Profile creation, deletion, and apply flows stay explicit."
+          label="Mode"
+          tone={submitting || applyingProfileId ? "warning" : "success"}
+          value={submitting ? "creating" : applyingProfileId ? "applying" : "ready"}
+        />
+      </section>
 
       {error ? (
         <section className="error-banner" role="alert">
@@ -311,7 +333,7 @@ export function ProfilesPage() {
             </div>
           ) : null}
 
-          <div className="device-actions">
+          <ActionBar summary="Save the current draft as a reusable backend-stored profile.">
             <button
               className="refresh-button"
               disabled={submitting}
@@ -320,7 +342,7 @@ export function ProfilesPage() {
             >
               {submitting ? "Creating..." : "Create profile"}
             </button>
-          </div>
+          </ActionBar>
         </article>
 
         <article className="profile-list-card">

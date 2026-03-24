@@ -1,5 +1,5 @@
 import { PageIntro } from "../components/PageIntro";
-import { PlaceholderPanel } from "../components/PlaceholderPanel";
+import { Panel } from "../components/ui/Panel";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 
 export function SettingsPage() {
@@ -8,21 +8,21 @@ export function SettingsPage() {
   return (
     <main className="page-shell">
       <PageIntro
-        eyebrow="system"
-        title="Runtime and system settings"
-        description="This route is reserved for backend runtime info, daemon reachability, and operational diagnostics."
+        eyebrow="settings"
+        title="Settings"
+        description="Kleine Systemseite fuer allgemeine Hinweise und Wege in die aktiven Hardware-Werkzeuge."
       />
 
-      <PlaceholderPanel
-        title="Planned controls"
-        description="The route is intentionally broad enough for operational data and future backend toggles."
-        items={[
-          "Backend runtime panel",
-          "Daemon reachability panel",
-          "OpenRGB and config status",
-          "Support diagnostics",
-        ]}
-      />
+      <Panel
+        eyebrow="allgemein"
+        title="Allgemeine Einstellungen"
+        description="Kleine Systemseite mit Hinweisen zu den aktiven Werkzeugen."
+      >
+        <p>
+          Die RGB-Steuerung ist auf den Meteor-Workflow reduziert. Verwende die RGB-Effekte-Seite,
+          um die globale Route und den Meteor-Effekt ueber mehrere Luefter und Cluster zu steuern.
+        </p>
+      </Panel>
     </main>
   );
 }

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use lianli_transport::usb::{UsbTransport, USB_TIMEOUT};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, Ordering},
@@ -33,10 +34,33 @@ static CMD_RX_QUERY_34: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010434"))
 static CMD_RX_QUERY_37: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010437"));
 static CMD_RX_LCD_MODE: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010430"));
 
+const GET_DEV_TIMEOUT: Duration = Duration::from_millis(1_000);
+const RX_DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
+const RX_PRIME_SETTLE: Duration = Duration::from_millis(50);
+const DISCOVERY_RESCAN_THRESHOLD: u16 = 3;
+const DISCOVERY_DEVICE_GRACE_POLLS: u8 = 24;
+const FAN_PWM_SEND_REPEATS: u8 = 3;
+const FAN_PWM_REPEAT_GAP: Duration = Duration::from_millis(5);
+
 fn decode_command(prefix: &str) -> Vec<u8> {
     let mut bytes = hex::decode(prefix).expect("valid hex literal");
     bytes.resize(64, 0u8);
     bytes
+}
+
+fn preferred_scan_channels(seed: u8) -> Vec<u8> {
+    let mut channels = Vec::with_capacity(40);
+    for channel in std::iter::once(seed)
+        .chain(std::iter::once(8u8))
+        .chain((2..=38).filter(|&ch| ch % 2 == 0))
+        .chain((1..=39).filter(|&ch| ch % 2 == 1))
+    {
+        if channel == 0 || channels.contains(&channel) {
+            continue;
+        }
+        channels.push(channel);
+    }
+    channels
 }
 
 /// Wireless fan device type, determines minimum duty and RPM curves.
@@ -165,6 +189,8 @@ pub struct DiscoveredDevice {
     pub fan_type: WirelessFanType,
     /// Index in the discovery list (used for video mode prep)
     pub list_index: u8,
+    /// How many discovery polls in a row this device was missing from.
+    pub missed_polls: u8,
 }
 
 impl DiscoveredDevice {
@@ -268,13 +294,18 @@ impl SimulatedWireless {
             cmd_seq: 1,
             fan_type: self.fan_type,
             list_index: 0,
+            missed_polls: 0,
         }
     }
 
     fn apply(&self, controller: &WirelessController) {
         *controller.master_mac.lock() = self.master_mac;
         *controller.master_channel.lock() = self.channel;
+        *controller.discovery_query_channel.lock() = self.channel;
         *controller.discovered_devices.lock() = vec![self.build_device()];
+        controller
+            .discovery_failures
+            .store(0, Ordering::Relaxed);
         match self.mobo_pwm {
             Some(v) => controller.mobo_pwm.store(v as u16, Ordering::Relaxed),
             None => controller.mobo_pwm.store(0xFFFF, Ordering::Relaxed),
@@ -330,7 +361,6 @@ fn parse_device_record(data: &[u8], list_index: u8) -> Option<DiscoveredDevice> 
 
     let channel = data[12];
     let rx_type = data[13];
-    let fan_count = data[19].min(4);
 
     let mut fan_types = [0u8; 4];
     fan_types.copy_from_slice(&data[24..28]);
@@ -347,6 +377,23 @@ fn parse_device_record(data: &[u8], list_index: u8) -> Option<DiscoveredDevice> 
     current_pwm.copy_from_slice(&data[36..40]);
 
     let cmd_seq = data[40];
+    let reported_fan_count = data[19];
+    let inferred_fan_count = fan_types
+        .iter()
+        .filter(|&&fan_type| fan_type != 0)
+        .count()
+        .max(fan_rpms.iter().filter(|&&rpm| rpm > 0).count()) as u8;
+    let fan_count = match reported_fan_count {
+        1..=4 => reported_fan_count,
+        _ => inferred_fan_count.min(4),
+    };
+
+    if reported_fan_count != fan_count {
+        debug!(
+            "  Device record {list_index}: adjusted invalid fan count 0x{reported_fan_count:02x} -> {} using slot telemetry",
+            fan_count
+        );
+    }
 
     // Classify fan type from the first non-zero fan type byte
     let fan_type = fan_types
@@ -368,7 +415,73 @@ fn parse_device_record(data: &[u8], list_index: u8) -> Option<DiscoveredDevice> 
         cmd_seq,
         fan_type,
         list_index,
+        missed_polls: 0,
     })
+}
+
+fn stabilize_discovery_snapshot(previous: &[DiscoveredDevice], found: &mut [DiscoveredDevice]) {
+    for device in found.iter_mut() {
+        let Some(previous_device) = previous.iter().find(|candidate| {
+            candidate.rx_type == device.rx_type
+                && candidate.fan_count == device.fan_count
+                && candidate.fan_type == device.fan_type
+                && candidate.channel == device.channel
+        }) else {
+            continue;
+        };
+
+        let previous_zero_bytes = previous_device.mac.iter().filter(|&&byte| byte == 0).count();
+        let new_zero_bytes = device.mac.iter().filter(|&&byte| byte == 0).count();
+
+        if new_zero_bytes >= previous_zero_bytes + 2 {
+            debug!(
+                "GetDev: preserving stable MAC {} over suspicious update {}",
+                previous_device.mac_str(),
+                device.mac_str()
+            );
+            device.mac = previous_device.mac;
+        }
+    }
+}
+
+fn merge_missing_discovery_devices(
+    previous: &[DiscoveredDevice],
+    found: &mut Vec<DiscoveredDevice>,
+    _master_mac: &[u8; 6],
+) {
+    if previous.is_empty() || found.is_empty() {
+        return;
+    }
+
+    for previous_device in previous {
+        if is_empty_mac(&previous_device.mac) {
+            continue;
+        }
+
+        if found.iter().any(|device| device.mac == previous_device.mac) {
+            continue;
+        }
+
+        let next_miss_count = previous_device.missed_polls.saturating_add(1);
+        if next_miss_count > DISCOVERY_DEVICE_GRACE_POLLS {
+            debug!(
+                "GetDev: dropping stale wireless device {} after {} missed poll(s)",
+                previous_device.mac_str(),
+                previous_device.missed_polls,
+            );
+            continue;
+        }
+
+        let mut preserved = previous_device.clone();
+        preserved.missed_polls = next_miss_count;
+        debug!(
+            "GetDev: preserving missing wireless device {} for grace poll {}/{}",
+            preserved.mac_str(),
+            preserved.missed_polls,
+            DISCOVERY_DEVICE_GRACE_POLLS,
+        );
+        found.push(preserved);
+    }
 }
 
 pub struct WirelessController {
@@ -380,7 +493,10 @@ pub struct WirelessController {
     video_mode_active: Arc<AtomicBool>,
     master_mac: Arc<Mutex<[u8; 6]>>,
     master_channel: Arc<Mutex<u8>>,
+    discovery_query_channel: Arc<Mutex<u8>>,
     discovered_devices: Arc<Mutex<Vec<DiscoveredDevice>>>,
+    locally_detached: Arc<Mutex<HashSet<[u8; 6]>>>,
+    discovery_failures: Arc<AtomicU16>,
     /// Motherboard PWM duty cycle (0-255) extracted from RX GetDev response bytes [2:3].
     /// 0xFFFF means unavailable/not yet read.
     mobo_pwm: Arc<AtomicU16>,
@@ -397,7 +513,10 @@ impl Clone for WirelessController {
             video_mode_active: Arc::clone(&self.video_mode_active),
             master_mac: Arc::clone(&self.master_mac),
             master_channel: Arc::clone(&self.master_channel),
+            discovery_query_channel: Arc::clone(&self.discovery_query_channel),
             discovered_devices: Arc::clone(&self.discovered_devices),
+            locally_detached: Arc::clone(&self.locally_detached),
+            discovery_failures: Arc::clone(&self.discovery_failures),
             mobo_pwm: Arc::clone(&self.mobo_pwm),
         }
     }
@@ -415,7 +534,10 @@ impl WirelessController {
             video_mode_active: Arc::new(AtomicBool::new(false)),
             master_mac: Arc::new(Mutex::new([0u8; 6])),
             master_channel: Arc::new(Mutex::new(8)),
+            discovery_query_channel: Arc::new(Mutex::new(8)),
             discovered_devices: Arc::new(Mutex::new(Vec::new())),
+            locally_detached: Arc::new(Mutex::new(HashSet::new())),
+            discovery_failures: Arc::new(AtomicU16::new(0)),
             mobo_pwm: Arc::new(AtomicU16::new(0xFFFF)),
         };
 
@@ -524,9 +646,9 @@ impl WirelessController {
                 let mut mac = self.master_mac.lock();
                 mac.copy_from_slice(&response[1..7]);
                 if mac.iter().any(|&b| b != 0) {
-                    *self.master_channel.lock() = channel;
+                    *self.discovery_query_channel.lock() = channel;
                     info!(
-                        "Master MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} channel={}",
+                        "Master MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} query_channel={}",
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], channel
                     );
                     if len >= 13 {
@@ -565,17 +687,33 @@ impl WirelessController {
                 .context("sending TX reset")?;
         }
 
+        self.prime_rx_for_discovery()?;
+
         self.video_mode_active.store(false, Ordering::Release);
         self.poll_stop.store(false, Ordering::SeqCst);
 
         let stop_flag = self.poll_stop.clone();
         let discovered_devices = Arc::clone(&self.discovered_devices);
         let mobo_pwm = Arc::clone(&self.mobo_pwm);
+        let master_mac = Arc::clone(&self.master_mac);
+        let master_channel = Arc::clone(&self.master_channel);
+        let discovery_query_channel = Arc::clone(&self.discovery_query_channel);
+        let discovery_failures = Arc::clone(&self.discovery_failures);
 
         self.poll_thread = Some(thread::spawn(move || {
             let mut found_devices = false;
             while !stop_flag.load(Ordering::SeqCst) {
-                if let Err(err) = poll_and_discover(&rx, &discovered_devices, &mobo_pwm) {
+                if let Err(err) = poll_and_discover(
+                    &rx,
+                    Some(&tx),
+                    &discovered_devices,
+                    &mobo_pwm,
+                    &master_mac,
+                    &master_channel,
+                    &discovery_query_channel,
+                    &discovery_failures,
+                    false,
+                ) {
                     warn!("RX polling error: {err:?}");
                     break;
                 }
@@ -588,6 +726,23 @@ impl WirelessController {
         }));
 
         thread::sleep(Duration::from_millis(1500));
+        Ok(())
+    }
+
+    fn prime_rx_for_discovery(&self) -> Result<()> {
+        if self.simulated.is_some() {
+            return Ok(());
+        }
+
+        let rx = self
+            .rx
+            .as_ref()
+            .context("RX device must be connected for discovery priming")?;
+
+        drain_rx_buffer(rx);
+        self.send_rx_sequence()?;
+        thread::sleep(RX_PRIME_SETTLE);
+        drain_rx_buffer(rx);
         Ok(())
     }
 
@@ -704,6 +859,11 @@ impl WirelessController {
         self.discovered_devices.lock().clone()
     }
 
+    /// Whether the app has locally detached this device from active control.
+    pub fn is_locally_detached(&self, mac: &[u8; 6]) -> bool {
+        self.locally_detached.lock().contains(mac)
+    }
+
     /// Get a snapshot of a single device by its MAC address.
     pub fn device_by_mac(&self, mac: &[u8; 6]) -> Option<DiscoveredDevice> {
         self.discovered_devices
@@ -723,6 +883,203 @@ impl WirelessController {
             0xFFFF => None,
             v => Some(v as u8),
         }
+    }
+
+    pub fn master_mac(&self) -> [u8; 6] {
+        *self.master_mac.lock()
+    }
+
+    pub fn refresh_discovery(&self) -> Result<usize> {
+        if let Some(sim) = &self.simulated {
+            sim.apply(self);
+            return Ok(self.discovered_device_count());
+        }
+
+        let rx = self
+            .rx
+            .as_ref()
+            .context("RX device must be connected for discovery refresh")?;
+        let tx = self.tx.as_ref();
+
+        self.prime_rx_for_discovery()?;
+        poll_and_discover(
+            rx,
+            tx,
+            &self.discovered_devices,
+            &self.mobo_pwm,
+            &self.master_mac,
+            &self.master_channel,
+            &self.discovery_query_channel,
+            &self.discovery_failures,
+            true,
+        )?;
+
+        Ok(self.discovered_device_count())
+    }
+
+    pub fn bind_device(&self, device_id: &str) -> Result<()> {
+        let device = self
+            .discovered_devices
+            .lock()
+            .iter()
+            .find(|candidate| format!("wireless:{}", candidate.mac_str()) == device_id)
+            .cloned()
+            .context(format!("Wireless device not found in discovery: {device_id}"))?;
+
+        let master_mac = *self.master_mac.lock();
+        if is_empty_mac(&master_mac) {
+            bail!("wireless master MAC not initialized");
+        }
+
+        if device.master_mac == master_mac {
+            let was_locally_detached = self.locally_detached.lock().remove(&device.mac);
+            if was_locally_detached {
+                info!(
+                    "Reconnected locally detached wireless device {} to the current dongle",
+                    device.mac_str()
+                );
+            } else {
+                debug!(
+                    "Wireless device {} is already connected to the current dongle",
+                    device.mac_str()
+                );
+            }
+            return Ok(());
+        }
+
+        if !is_empty_mac(&device.master_mac) && device.master_mac != master_mac {
+            bail!(
+                "wireless device {} is already paired to another controller",
+                device.mac_str()
+            );
+        }
+
+        let master_channel = *self.master_channel.lock();
+        let target_rx_type = self
+            .next_available_rx_type(Some(&device.mac))
+            .context("no free wireless RX slot available for bind")?;
+        let slave_index = self.next_bind_index(Some(&device.mac));
+
+        if self.simulated.is_some() {
+            let mut devices = self.discovered_devices.lock();
+            if let Some(candidate) = devices.iter_mut().find(|candidate| candidate.mac == device.mac)
+            {
+                candidate.master_mac = master_mac;
+                candidate.channel = master_channel;
+                candidate.rx_type = target_rx_type;
+            }
+            self.locally_detached.lock().remove(&device.mac);
+            info!(
+                "[sim] Bound wireless device {} to current master (rx={}, slot={})",
+                device.mac_str(),
+                target_rx_type,
+                slave_index
+            );
+            return Ok(());
+        }
+
+        let tx = self.tx.as_ref().context("TX device not connected")?;
+
+        let mut rf_data = vec![0u8; RF_DATA_SIZE];
+        rf_data[0] = RF_SELECT;
+        rf_data[1] = RF_PWM_CMD;
+        rf_data[2..8].copy_from_slice(&device.mac);
+        rf_data[8..14].copy_from_slice(&master_mac);
+        rf_data[14] = target_rx_type;
+        rf_data[15] = master_channel;
+        rf_data[16] = slave_index;
+        rf_data[17..21].copy_from_slice(&device.current_pwm);
+
+        let handle = tx.lock();
+        send_control_rf_payload(
+            &handle,
+            device.channel,
+            device.rx_type,
+            &rf_data,
+            FAN_PWM_SEND_REPEATS,
+            FAN_PWM_REPEAT_GAP,
+            "wireless bind",
+        )?;
+        drop(handle);
+
+        {
+            let mut devices = self.discovered_devices.lock();
+            if let Some(candidate) = devices.iter_mut().find(|candidate| candidate.mac == device.mac)
+            {
+                candidate.master_mac = master_mac;
+                candidate.channel = master_channel;
+                candidate.rx_type = target_rx_type;
+            }
+        }
+        self.locally_detached.lock().remove(&device.mac);
+
+        info!(
+            "Bound wireless device {} to current master (rx={}, slot={})",
+            device.mac_str(),
+            target_rx_type,
+            slave_index
+        );
+        Ok(())
+    }
+
+    /// Disconnect a discovered wireless device from the active dongle/controller.
+    ///
+    /// This mirrors L-Connect's RF unbind flow by sending a control frame with:
+    /// - empty target master MAC
+    /// - target RX type `0`
+    /// - target channel = current master channel
+    /// - slave index `0`
+    /// - current PWM bytes kept intact
+    pub fn unbind_device(&self, device_id: &str) -> Result<()> {
+        let device = self
+            .discovered_devices
+            .lock()
+            .iter()
+            .find(|candidate| format!("wireless:{}", candidate.mac_str()) == device_id)
+            .cloned()
+            .context(format!("Wireless device not found in discovery: {device_id}"))?;
+
+        if self.simulated.is_some() {
+            let mut devices = self.discovered_devices.lock();
+            if let Some(candidate) = devices.iter_mut().find(|candidate| candidate.mac == device.mac)
+            {
+                candidate.master_mac = [0; 6];
+                candidate.rx_type = 0;
+                candidate.missed_polls = 0;
+            }
+            self.locally_detached.lock().insert(device.mac);
+            info!("[sim] Unbound wireless device {}", device.mac_str());
+            return Ok(());
+        }
+
+        let tx = self.tx.as_ref().context("TX device not connected")?;
+        let master_channel = *self.master_channel.lock();
+
+        let mut rf_data = vec![0u8; RF_DATA_SIZE];
+        rf_data[0] = RF_SELECT;
+        rf_data[1] = RF_PWM_CMD;
+        rf_data[2..8].copy_from_slice(&device.mac);
+        rf_data[14] = 0;
+        rf_data[15] = master_channel;
+        rf_data[16] = 0;
+        rf_data[17..21].copy_from_slice(&device.current_pwm);
+
+        let handle = tx.lock();
+        send_control_rf_payload(
+            &handle,
+            device.channel,
+            device.rx_type,
+            &rf_data,
+            FAN_PWM_SEND_REPEATS,
+            FAN_PWM_REPEAT_GAP,
+            "wireless unbind",
+        )?;
+        drop(handle);
+        self.locally_detached.lock().insert(device.mac);
+
+        info!("Sent wireless unbind request for {}", device.mac_str());
+
+        Ok(())
     }
 
     /// Set fan PWM values for a specific device identified by MAC address.
@@ -806,29 +1163,33 @@ impl WirelessController {
         rf_data[16] = 1;                   // Sequence index (1 for one-shot)
         rf_data[17..21].copy_from_slice(&pwm);
 
-        // Send as 4 USB packets (60-byte chunks)
         let handle = tx.lock();
-        for chunk_idx in 0..RF_CHUNKS as u8 {
-            let mut packet = vec![0u8; 64];
-            packet[0] = USB_CMD_SEND_RF;
-            packet[1] = chunk_idx;         // Sequence number
-            packet[2] = device.channel;    // Device's current RF channel
-            packet[3] = device.rx_type;    // Device's RX type
-
-            let start = chunk_idx as usize * RF_CHUNK_SIZE;
-            let end = start + RF_CHUNK_SIZE;
-            packet[4..64].copy_from_slice(&rf_data[start..end]);
-
-            handle
-                .write_bulk(&packet, USB_TIMEOUT)
-                .context("sending fan speed RF packet")?;
-            thread::sleep(Duration::from_millis(1));
-        }
+        send_control_rf_payload(
+            &handle,
+            device.channel,
+            device.rx_type,
+            &rf_data,
+            FAN_PWM_SEND_REPEATS,
+            FAN_PWM_REPEAT_GAP,
+            "fan speed",
+        )?;
 
         debug!(
-            "Set fan PWM for {} (rx={}, ch={}): {:?}",
-            device.mac_str(), device.rx_type, device.channel, pwm
+            "Set fan PWM for {} (rx={}, ch={}, repeats={}): {:?}",
+            device.mac_str(),
+            device.rx_type,
+            device.channel,
+            FAN_PWM_SEND_REPEATS,
+            pwm
         );
+
+        // Keep our local discovery snapshot aligned with the last successful
+        // write so transient RX misses do not trigger unnecessary re-sends.
+        let mut devices = self.discovered_devices.lock();
+        if let Some(device_state) = devices.iter_mut().find(|d| d.mac == device.mac) {
+            device_state.current_pwm = pwm;
+            device_state.cmd_seq = device_state.cmd_seq.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -1062,6 +1423,43 @@ impl WirelessController {
         self.tx.take();
         self.rx.take();
     }
+
+    fn next_available_rx_type(&self, exclude_mac: Option<&[u8; 6]>) -> Option<u8> {
+        let master_mac = *self.master_mac.lock();
+        let devices = self.discovered_devices.lock();
+
+        let mut max_used = 1u8;
+        for device in devices.iter() {
+            if !is_bound_to_master(device, &master_mac, exclude_mac) {
+                continue;
+            }
+            max_used = max_used.max(device.rx_type);
+        }
+
+        for candidate in max_used..=14 {
+            if rx_type_is_free(&devices, &master_mac, exclude_mac, candidate) {
+                return Some(candidate);
+            }
+        }
+
+        for candidate in 1..=14 {
+            if rx_type_is_free(&devices, &master_mac, exclude_mac, candidate) {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    fn next_bind_index(&self, exclude_mac: Option<&[u8; 6]>) -> u8 {
+        let master_mac = *self.master_mac.lock();
+        let devices = self.discovered_devices.lock();
+        let bound_count = devices
+            .iter()
+            .filter(|device| is_bound_to_master(device, &master_mac, exclude_mac))
+            .count() as u8;
+        bound_count.saturating_add(1).max(1)
+    }
 }
 
 impl Default for WirelessController {
@@ -1074,6 +1472,41 @@ impl Drop for WirelessController {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn send_control_rf_payload(
+    handle: &UsbTransport,
+    channel: u8,
+    rx_type: u8,
+    rf_data: &[u8],
+    repeats: u8,
+    repeat_gap: Duration,
+    context: &str,
+) -> Result<()> {
+    for repeat in 0..repeats {
+        for chunk_idx in 0..RF_CHUNKS as u8 {
+            let mut packet = vec![0u8; 64];
+            packet[0] = USB_CMD_SEND_RF;
+            packet[1] = chunk_idx;
+            packet[2] = channel;
+            packet[3] = rx_type;
+
+            let start = chunk_idx as usize * RF_CHUNK_SIZE;
+            let end = start + RF_CHUNK_SIZE;
+            packet[4..64].copy_from_slice(&rf_data[start..end]);
+
+            handle
+                .write_bulk(&packet, USB_TIMEOUT)
+                .with_context(|| format!("sending {context} RF packet"))?;
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        if repeat + 1 < repeats {
+            thread::sleep(repeat_gap);
+        }
+    }
+
+    Ok(())
 }
 
 /// Apply minimum duty enforcement and CLV1 PWM filter.
@@ -1108,103 +1541,306 @@ fn apply_pwm_constraints(pwm: &mut [u8; 4], device: &DiscoveredDevice) {
 
 /// Polls the RX device for the current device list.
 ///
-/// Sends GetDev command (0x10, page=1) and parses the response into
-/// full 42-byte device records.
+/// Current firmware expects GetDev in the form `[0x10, channel, ...]`
+/// rather than the older `[0x10, page=1, ...]` shape.
 fn poll_and_discover(
     rx: &Arc<Mutex<UsbTransport>>,
+    tx: Option<&Arc<Mutex<UsbTransport>>>,
     discovered_devices: &Arc<Mutex<Vec<DiscoveredDevice>>>,
     mobo_pwm: &Arc<AtomicU16>,
+    master_mac: &Arc<Mutex<[u8; 6]>>,
+    master_channel: &Arc<Mutex<u8>>,
+    discovery_query_channel: &Arc<Mutex<u8>>,
+    discovery_failures: &Arc<AtomicU16>,
+    force_full_scan: bool,
 ) -> Result<()> {
-    // GetDev command: [0x10, page_number, ...pad...]
-    let mut cmd = vec![0u8; 64];
-    cmd[0] = USB_CMD_SEND_RF; // GetDev uses the same command byte
-    cmd[1] = 0x01;            // Page 1
+    let seeded_channel = *discovery_query_channel.lock();
+    let had_devices = !discovered_devices.lock().is_empty();
+    let fallback_allowed = force_full_scan
+        || !had_devices
+        || discovery_failures.load(Ordering::Relaxed) >= DISCOVERY_RESCAN_THRESHOLD;
+    let channels = if fallback_allowed {
+        preferred_scan_channels(seeded_channel)
+    } else {
+        vec![seeded_channel]
+    };
 
-    let handle = rx.lock();
-    handle
-        .write_bulk(&cmd, USB_TIMEOUT)
-        .context("sending GetDev command")?;
+    for channel in channels {
+        let mut cmd = vec![0u8; 64];
+        cmd[0] = USB_CMD_SEND_RF;
+        cmd[1] = channel;
 
-    // Response: [0]=0x10, [1]=device_count, [2-3]=mobo_pwm or version, [4+]=42-byte records
-    let mut response = [0u8; 512];
-    match handle.read_bulk(&mut response, Duration::from_millis(200)) {
-        Ok(len) if len >= 4 => {
-            if response[0] != USB_CMD_SEND_RF {
-                debug!("GetDev: unexpected response 0x{:02x}", response[0]);
-                return Ok(());
-            }
+        let handle = rx.lock();
+        handle
+            .write_bulk(&cmd, USB_TIMEOUT)
+            .with_context(|| format!("sending GetDev command on channel {channel}"))?;
 
-            let device_count = response[1] as usize;
-
-            // Extract motherboard PWM from response bytes [2:3].
-            // Byte [2] high bit = unavailable flag. When clear:
-            //   off_time = byte[2] & 0x7F, on_time = byte[3]
-            //   pwm = 255 * on_time / (on_time + off_time)
-            let indicator = response[2];
-            if indicator >> 7 == 1 {
-                // High bit set — mobo PWM unavailable (bytes are firmware version instead)
-                mobo_pwm.store(0xFFFF, Ordering::Relaxed);
-            } else {
-                let off_time = (indicator & 0x7F) as u16;
-                let on_time = response[3] as u16;
-                let denominator = off_time + on_time;
-                if denominator > 0 {
-                    let pwm = (255u16 * on_time / denominator).min(255);
-                    mobo_pwm.store(pwm, Ordering::Relaxed);
-                } else {
-                    mobo_pwm.store(0xFFFF, Ordering::Relaxed);
-                }
-            }
-
-            debug!("GetDev: {device_count} device(s) reported");
-
-            if device_count == 0 || device_count > 12 {
-                return Ok(());
-            }
-
-            let mut found = Vec::new();
-            let mut offset = 4; // After header [cmd, count, ver[2]]
-
-            for idx in 0..device_count {
-                if offset + 42 > len {
-                    debug!("GetDev: response truncated at device {idx}");
-                    break;
-                }
-
-                if let Some(device) = parse_device_record(&response[offset..offset + 42], idx as u8) {
+        let mut response = [0u8; 512];
+        match handle.read_bulk(&mut response, GET_DEV_TIMEOUT) {
+            Ok(len) if len >= 4 => {
+                if response[0] != USB_CMD_SEND_RF {
                     debug!(
-                        "  [{}] {} type=0x{:02x} fans={} RPM=[{},{},{},{}] PWM=[{},{},{},{}]",
-                        idx, device, device.device_type,
-                        device.fan_count,
-                        device.fan_rpms[0], device.fan_rpms[1],
-                        device.fan_rpms[2], device.fan_rpms[3],
-                        device.current_pwm[0], device.current_pwm[1],
-                        device.current_pwm[2], device.current_pwm[3],
+                        "GetDev[ch={channel}]: unexpected response 0x{:02x}",
+                        response[0]
                     );
-                    found.push(device);
+                    continue;
                 }
 
-                offset += 42;
-            }
+                let device_count = response[1] as usize;
+                debug!("GetDev[ch={channel}]: {device_count} device slot(s) reported");
 
-            let mut devices = discovered_devices.lock();
-            if !found.is_empty() {
-                let old_count = devices.len();
-                *devices = found;
-                if old_count != devices.len() {
-                    info!(
-                        "Discovered {} wireless device(s)",
-                        devices.len()
-                    );
+                if device_count == 0 || device_count > 12 {
+                    continue;
                 }
+
+                let indicator = response[2];
+                if indicator >> 7 == 1 {
+                    mobo_pwm.store(0xFFFF, Ordering::Relaxed);
+                } else {
+                    let off_time = (indicator & 0x7F) as u16;
+                    let on_time = response[3] as u16;
+                    let denominator = off_time + on_time;
+                    if denominator > 0 {
+                        let pwm = (255u16 * on_time / denominator).min(255);
+                        mobo_pwm.store(pwm, Ordering::Relaxed);
+                    } else {
+                        mobo_pwm.store(0xFFFF, Ordering::Relaxed);
+                    }
+                }
+
+                let mut found = Vec::new();
+                let mut offset = 4;
+
+                for idx in 0..device_count {
+                    if offset + 42 > len {
+                        debug!("GetDev[ch={channel}]: response truncated at device {idx}");
+                        break;
+                    }
+
+                    if let Some(device) =
+                        parse_device_record(&response[offset..offset + 42], idx as u8)
+                    {
+                        debug!(
+                            "  [ch={channel} idx={idx}] {} type=0x{:02x} fans={} RPM=[{},{},{},{}] PWM=[{},{},{},{}]",
+                            device,
+                            device.device_type,
+                            device.fan_count,
+                            device.fan_rpms[0],
+                            device.fan_rpms[1],
+                            device.fan_rpms[2],
+                            device.fan_rpms[3],
+                            device.current_pwm[0],
+                            device.current_pwm[1],
+                            device.current_pwm[2],
+                            device.current_pwm[3],
+                        );
+                        found.push(device);
+                    }
+
+                    offset += 42;
+                }
+
+                if found.is_empty() {
+                    debug!("GetDev[ch={channel}]: no parseable wireless devices");
+                    continue;
+                }
+
+                let previous_devices = discovered_devices.lock().clone();
+                stabilize_discovery_snapshot(&previous_devices, &mut found);
+                let current_master_mac = *master_mac.lock();
+                merge_missing_discovery_devices(&previous_devices, &mut found, &current_master_mac);
+
+                let reported_rf_channel = found.first().map(|device| device.channel).filter(|&candidate| {
+                    candidate > 0 && found.iter().all(|device| device.channel == candidate)
+                });
+
+                {
+                    let mut devices = discovered_devices.lock();
+                    let old_count = devices.len();
+                    *devices = found;
+                    if old_count != devices.len() {
+                        info!("Discovered {} wireless device(s)", devices.len());
+                    }
+                }
+
+                discovery_failures.store(0, Ordering::Relaxed);
+
+                if let Some(rf_channel) = reported_rf_channel {
+                    let mut current_rf_channel = master_channel.lock();
+                    if *current_rf_channel != rf_channel {
+                        *current_rf_channel = rf_channel;
+                        info!("Wireless RF channel confirmed as {rf_channel}");
+                    }
+                }
+
+                if channel != seeded_channel {
+                    *discovery_query_channel.lock() = channel;
+                    debug!("Wireless discovery query locked onto channel {channel}");
+                }
+                return Ok(());
             }
-        }
-        Ok(_) => {}
-        Err(lianli_transport::TransportError::Usb(rusb::Error::Timeout)) => {}
-        Err(err) => {
-            debug!("GetDev error: {err}");
+            Ok(len) => {
+                debug!("GetDev[ch={channel}]: short response len={len} bytes");
+            }
+            Err(lianli_transport::TransportError::Usb(rusb::Error::Timeout)) => {
+                debug!("GetDev[ch={channel}]: read timeout waiting for response");
+            }
+            Err(err) => {
+                debug!("GetDev[ch={channel}] error: {err}");
+            }
         }
     }
 
+    let failure_count = discovery_failures
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+
+    if had_devices && !fallback_allowed {
+        debug!(
+            "GetDev[ch={seeded_channel}]: keeping previous discovery after transient miss ({failure_count}/{DISCOVERY_RESCAN_THRESHOLD})"
+        );
+        return Ok(());
+    }
+
+    if let Some(tx) = tx {
+        let mut cmd = vec![0u8; 64];
+        cmd[0] = USB_CMD_SEND_RF;
+        cmd[1] = seeded_channel;
+
+        let handle = tx.lock();
+        if let Err(err) = handle.write_bulk(&cmd, USB_TIMEOUT) {
+            debug!("GetDev[TX fallback]: write error: {err}");
+        } else {
+            let mut tx_response = [0u8; 512];
+            match handle.read_bulk(&mut tx_response, GET_DEV_TIMEOUT) {
+                Ok(len) => {
+                    debug!(
+                        "GetDev[TX fallback]: response len={len} header={:02x?}",
+                        &tx_response[..len.min(16)]
+                    );
+                }
+                Err(lianli_transport::TransportError::Usb(rusb::Error::Timeout)) => {
+                    debug!("GetDev[TX fallback]: read timeout waiting for response");
+                }
+                Err(err) => {
+                    debug!("GetDev[TX fallback] error: {err}");
+                }
+            }
+        }
+    }
+
+    if had_devices {
+        debug!(
+            "GetDev: keeping previous discovery after unsuccessful rescan ({failure_count} consecutive miss(es))"
+        );
+    }
+
     Ok(())
+}
+
+fn drain_rx_buffer(rx: &Arc<Mutex<UsbTransport>>) {
+    let mut discarded = 0usize;
+    let mut buf = [0u8; 64];
+    let handle = rx.lock();
+
+    loop {
+        match handle.read_bulk(&mut buf, RX_DRAIN_TIMEOUT) {
+            Ok(len) => {
+                discarded += 1;
+                debug!("RX drain: discarded stale packet {:02x?}", &buf[..len.min(8)]);
+                if discarded >= 8 {
+                    break;
+                }
+            }
+            Err(lianli_transport::TransportError::Usb(rusb::Error::Timeout)) => break,
+            Err(err) => {
+                debug!("RX drain error: {err}");
+                break;
+            }
+        }
+    }
+
+    if discarded > 0 {
+        debug!("RX drain: discarded {discarded} stale packet(s)");
+    }
+}
+
+fn is_empty_mac(mac: &[u8; 6]) -> bool {
+    mac.iter().all(|&byte| byte == 0)
+}
+
+fn is_bound_to_master(
+    device: &DiscoveredDevice,
+    master_mac: &[u8; 6],
+    exclude_mac: Option<&[u8; 6]>,
+) -> bool {
+    if exclude_mac.is_some_and(|candidate| candidate == &device.mac) {
+        return false;
+    }
+
+    !is_empty_mac(&device.master_mac) && &device.master_mac == master_mac
+}
+
+fn rx_type_is_free(
+    devices: &[DiscoveredDevice],
+    master_mac: &[u8; 6],
+    exclude_mac: Option<&[u8; 6]>,
+    candidate: u8,
+) -> bool {
+    devices.iter().all(|device| {
+        !is_bound_to_master(device, master_mac, exclude_mac) || device.rx_type != candidate
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        merge_missing_discovery_devices, DiscoveredDevice, WirelessFanType,
+        DISCOVERY_DEVICE_GRACE_POLLS,
+    };
+
+    fn test_device(mac_tail: u8, master_mac: [u8; 6], missed_polls: u8) -> DiscoveredDevice {
+        DiscoveredDevice {
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, mac_tail],
+            master_mac,
+            channel: 8,
+            rx_type: 1,
+            device_type: 0,
+            fan_count: 1,
+            fan_types: [36, 0, 0, 0],
+            fan_rpms: [0, 0, 0, 0],
+            current_pwm: [0, 0, 0, 0],
+            cmd_seq: 0,
+            fan_type: WirelessFanType::SlInf,
+            list_index: 0,
+            missed_polls,
+        }
+    }
+
+    #[test]
+    fn preserves_available_devices_across_transient_discovery_misses() {
+        let previous = vec![test_device(0x01, [0; 6], 0)];
+        let mut found = vec![test_device(0x02, [0; 6], 0)];
+
+        merge_missing_discovery_devices(&previous, &mut found, &[0; 6]);
+
+        assert_eq!(found.len(), 2);
+        let preserved = found
+            .iter()
+            .find(|device| device.mac == previous[0].mac)
+            .expect("available device should be preserved");
+        assert_eq!(preserved.master_mac, [0; 6]);
+        assert_eq!(preserved.missed_polls, 1);
+    }
+
+    #[test]
+    fn drops_devices_after_grace_window_expires() {
+        let previous = vec![test_device(0x01, [0; 6], DISCOVERY_DEVICE_GRACE_POLLS)];
+        let mut found = vec![test_device(0x02, [0; 6], 0)];
+
+        merge_missing_discovery_devices(&previous, &mut found, &[0; 6]);
+
+        assert_eq!(found.len(), 1);
+        assert!(found.iter().all(|device| device.mac != previous[0].mac));
+    }
 }

@@ -15,6 +15,13 @@ extern "C" {
     ) -> usize;
 
     fn tuz_max_compressed_size(input_len: usize) -> usize;
+
+    fn tuz_decompress_mem_wrapper(
+        input: *const c_uchar,
+        input_len: usize,
+        output: *mut c_uchar,
+        output_capacity: usize,
+    ) -> usize;
 }
 
 /// Default dictionary size (4KB).
@@ -49,6 +56,39 @@ pub fn compress(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Decompress tinyuz-compressed data.
+///
+/// `output_capacity` should be the expected decompressed size
+/// (e.g. `total_frames * led_num * 3` for RGB frame data).
+///
+/// Returns the decompressed bytes, or an error if decompression fails.
+pub fn decompress(input: &[u8], output_capacity: usize) -> anyhow::Result<Vec<u8>> {
+    if input.is_empty() {
+        anyhow::bail!("tinyuz: cannot decompress empty input");
+    }
+    if output_capacity == 0 {
+        anyhow::bail!("tinyuz: output_capacity must be > 0");
+    }
+
+    let mut output = vec![0u8; output_capacity];
+
+    let decompressed_len = unsafe {
+        tuz_decompress_mem_wrapper(
+            input.as_ptr(),
+            input.len(),
+            output.as_mut_ptr(),
+            output.len(),
+        )
+    };
+
+    if decompressed_len == 0 {
+        anyhow::bail!("tinyuz: decompression failed (returned 0)");
+    }
+
+    output.truncate(decompressed_len);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +117,36 @@ mod tests {
 
         let compressed = compress(&rgb_data).expect("compression should succeed");
         assert!(!compressed.is_empty());
+    }
+
+    #[test]
+    fn round_trip_solid_color() {
+        // Compress then decompress — output must match input
+        let mut rgb_data = Vec::new();
+        for _ in 0..44 {
+            rgb_data.extend_from_slice(&[94, 199, 255]);
+        }
+
+        let compressed = compress(&rgb_data).expect("compress");
+        let decompressed =
+            decompress(&compressed, rgb_data.len()).expect("decompress");
+        assert_eq!(decompressed, rgb_data);
+    }
+
+    #[test]
+    fn round_trip_meteor_frames() {
+        // Simulate 52 frames × 88 LEDs like a real Meteor transfer
+        let mut rgb_data = Vec::with_capacity(52 * 88 * 3);
+        for frame in 0..52u8 {
+            for led in 0..88u8 {
+                let brightness = ((frame as u16 + led as u16) % 256) as u8;
+                rgb_data.extend_from_slice(&[0, brightness / 2, brightness]);
+            }
+        }
+
+        let compressed = compress(&rgb_data).expect("compress");
+        let decompressed =
+            decompress(&compressed, rgb_data.len()).expect("decompress");
+        assert_eq!(decompressed, rgb_data);
     }
 }

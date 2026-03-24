@@ -2,72 +2,69 @@ import { screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DashboardPage } from "./DashboardPage";
 import { renderAtRoute } from "../test/render";
-import type { DaemonStatusResponse, DeviceView, RuntimeResponse } from "../types/api";
-import { useDashboardData } from "../hooks/useDashboardData";
+import { useMvpDashboardData } from "../hooks/useMvpDashboardData";
+import type { MvpCluster } from "../features/mvpClusters";
 
-vi.mock("../hooks/useDashboardData", () => ({
-  useDashboardData: vi.fn(),
+vi.mock("../hooks/useMvpDashboardData", () => ({
+  useMvpDashboardData: vi.fn(),
 }));
 
-const useDashboardDataMock = vi.mocked(useDashboardData);
+const useMvpDashboardDataMock = vi.mocked(useMvpDashboardData);
 
-function dashboardDevice(overrides: Partial<DeviceView> = {}): DeviceView {
+function cluster(overrides: Partial<MvpCluster> = {}): MvpCluster {
   return {
-    id: "wireless:one",
-    name: "Controller One",
-    family: "SlInf",
-    online: true,
-    capabilities: {
-      has_fan: true,
-      has_rgb: true,
-      has_lcd: false,
-      has_pump: false,
-      fan_count: 4,
-      per_fan_control: false,
-      mb_sync_support: false,
-      rgb_zone_count: 1,
-    },
-    state: {
-      fan_rpms: [900, 910, 920, 930],
-      coolant_temp: null,
-      streaming_active: false,
-    },
-    ...overrides,
-  };
-}
-
-function runtime(): RuntimeResponse {
-  return {
-    backend: {
-      host: "127.0.0.1",
-      port: 9000,
-      log_level: "info",
-      config_path: "/tmp/backend.json",
-      profile_store_path: "/tmp/profiles.json",
-      auth: {
-        enabled: false,
-        mode: "none",
-        reload_requires_restart: true,
-        basic_username_configured: false,
-        basic_password_configured: false,
-        token_configured: false,
-        proxy_header: null,
+    id: "desk-cluster",
+    label: "Desk cluster",
+    deviceIds: ["wireless:one"],
+    primaryDeviceId: "wireless:one",
+    fanCount: 4,
+    fanType: "SlInf",
+    status: "healthy",
+    devices: [],
+    primaryDevice: {
+      id: "wireless:one",
+      name: "wireless:one",
+      display_name: "Desk cluster",
+      family: "SlInf",
+      online: true,
+      ui_order: 10,
+      physical_role: "Wireless cluster",
+      capability_summary: "RGB | Fan",
+      current_mode_summary: "Ready",
+      controller: {
+        id: "wireless:mesh",
+        label: "Desk mesh",
+        kind: "wireless_mesh",
+      },
+      wireless: {
+        transport: "wireless",
+        channel: 8,
+        group_id: "desk-cluster",
+        group_label: "Desk cluster",
+        binding_state: "connected",
+        master_mac: "aa:bb",
+      },
+      health: {
+        level: "healthy",
+        summary: "Healthy",
+      },
+      capabilities: {
+        has_fan: true,
+        has_rgb: true,
+        has_lcd: false,
+        has_pump: false,
+        fan_count: 4,
+        per_fan_control: false,
+        mb_sync_support: false,
+        rgb_zone_count: 2,
+      },
+      state: {
+        fan_rpms: [900, 910, 920, 930],
+        coolant_temp: null,
+        streaming_active: false,
       },
     },
-    daemon: {
-      socket_path: "/tmp/lianli-daemon.sock",
-      config_path: "/tmp/config.json",
-      xdg_runtime_dir: "/tmp",
-      xdg_config_home: "/tmp",
-    },
-  };
-}
-
-function daemonStatus(): DaemonStatusResponse {
-  return {
-    reachable: true,
-    socket_path: "/tmp/lianli-daemon.sock",
-    error: null,
+    ...overrides,
   };
 }
 
@@ -76,46 +73,83 @@ describe("DashboardPage", () => {
     vi.clearAllMocks();
   });
 
-  it("renders device cards and metrics from dashboard data", () => {
-    useDashboardDataMock.mockReturnValue({
-      devices: [dashboardDevice()],
-      daemonStatus: daemonStatus(),
-      runtime: runtime(),
+  it("renders only the paired-cluster MVP card with fans, rgb, and disconnect actions", () => {
+    useMvpDashboardDataMock.mockReturnValue({
+      clusters: [cluster()],
+      fanStates: {
+        "desk-cluster": {
+          device_id: "wireless:one",
+          update_interval_ms: 1000,
+          rpms: [900, 910, 920, 930],
+          slots: [],
+          active_mode: "manual",
+        },
+      },
+      lightingStates: {
+        "desk-cluster": {
+          device_id: "wireless:one",
+          zones: [
+            {
+              zone: 0,
+              effect: "Static",
+              colors: ["#112233"],
+              speed: 2,
+              brightness_percent: 100,
+              direction: "Clockwise",
+              scope: "All",
+              smoothness_ms: 0,
+            },
+          ],
+        },
+      },
       loading: false,
       refreshing: false,
       error: null,
-      lastUpdated: "2026-03-14T10:00:00Z",
+      lastUpdated: "2026-03-17T10:00:00Z",
+      actionError: null,
+      actionSuccess: null,
+      disconnectingClusterId: null,
       refresh: vi.fn(),
+      disconnectCluster: vi.fn(),
     });
 
     renderAtRoute(<DashboardPage />);
 
-    expect(screen.getByText("Fleet dashboard and control entry points")).toBeInTheDocument();
-    expect(screen.getByText("Controller One")).toBeInTheDocument();
-    expect(screen.getByText("Detected controllers and wireless targets")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Details" })).toHaveAttribute(
+    expect(screen.getByText("Dashboard")).toBeInTheDocument();
+    expect(screen.getByText("desk-cluster")).toBeInTheDocument();
+    expect(screen.getByText("4")).toBeInTheDocument();
+    expect(screen.getAllByText("healthy").length).toBeGreaterThan(0);
+    expect(screen.getByText("900 / 910 / 920 / 930")).toBeInTheDocument();
+    expect(screen.getByText("Static #112233")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Fans" })).toHaveAttribute(
       "href",
-      "/devices",
+      "/fans?cluster=desk-cluster",
     );
-    expect(screen.getByRole("link", { name: "Lighting" })).toHaveAttribute("href", "/lighting");
-    expect(screen.getByRole("link", { name: "Fans" })).toHaveAttribute("href", "/fans");
+    expect(screen.getByRole("link", { name: "RGB" })).toHaveAttribute(
+      "href",
+      "/rgb?cluster=desk-cluster",
+    );
+    expect(screen.getByRole("button", { name: "Entkoppeln" })).toBeInTheDocument();
   });
 
-  it("renders an error banner when dashboard loading fails", () => {
-    useDashboardDataMock.mockReturnValue({
-      devices: [],
-      daemonStatus: null,
-      runtime: null,
+  it("renders the reduced empty state when no paired clusters exist", () => {
+    useMvpDashboardDataMock.mockReturnValue({
+      clusters: [],
+      fanStates: {},
+      lightingStates: {},
       loading: false,
       refreshing: false,
-      error: "daemon unavailable",
+      error: null,
       lastUpdated: null,
+      actionError: null,
+      actionSuccess: null,
+      disconnectingClusterId: null,
       refresh: vi.fn(),
+      disconnectCluster: vi.fn(),
     });
 
     renderAtRoute(<DashboardPage />);
 
-    expect(screen.getByText("Dashboard load failed.")).toBeInTheDocument();
-    expect(screen.getByText("daemon unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Keine gekoppelten Geräte")).toBeInTheDocument();
   });
 });

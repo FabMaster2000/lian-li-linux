@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ColorField } from "./ColorField";
+import { ColorField } from "./forms/ColorField";
 
 describe("ColorField", () => {
   it("renders the current color and forwards picker changes", () => {

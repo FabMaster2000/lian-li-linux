@@ -5,11 +5,30 @@
 <h1 align="center">Lian Li Linux</h1>
 
 <p align="center">
-  Open-source Linux replacement for L-Connect 3.<br>
-  Fan speed control, RGB/LED effects, LCD streaming, and sensor gauges for all Lian Li devices.
+  Open-source Linux web controller for Lian Li devices.<br>
+  Fan control, lighting workbenches, device inventory, profiles, LCD/media support, and daemon-backed browser access.
 </p>
 
 ---
+
+## Product Scope
+
+The repository now ships a web-first stack:
+
+```text
+lianli-daemon          User service for hardware access, fan control, and LCD streaming
+  lianli-devices       HID/USB device drivers
+  lianli-transport     HID/USB backends and wireless transport
+  lianli-media         Image/video/GIF encoding and sensor rendering
+  lianli-shared        IPC types, config schema, device IDs
+
+lianli-backend         HTTP/WebSocket bridge for browser clients
+frontend/              React/Vite web UI
+lianli-cli             CLI helper for daemon-facing smoke tests
+```
+
+The legacy native desktop GUI has been removed.
+All user-facing interaction is expected to happen through the browser-delivered web application.
 
 ## Supported Devices
 
@@ -36,99 +55,57 @@
 | Lancool 207 Digital | - | 1472x720 | WinUSB |
 | Universal Screen 8.8" | - | 1920x480 | WinUSB |
 
-## Architecture
+## Documentation
 
-```
-lianli-daemon          User service - fan control loop + LCD streaming
-  lianli-devices       HID/USB device drivers
-  lianli-transport     HID/USB backends and wireless transport
-  lianli-media         Image/video/GIF encoding and sensor rendering
-  lianli-shared        IPC types, config schema, device IDs
+Start here:
 
-lianli-gui             Slint desktop app - connects to daemon via Unix socket
-lianli-cli             CLI helper - reuses the same daemon IPC contract
-lianli-backend         HTTP/WebSocket bridge for browser clients
-frontend/              React/Vite web UI for dashboard, lighting, fans, and profiles
-```
+- [Documentation Index](docs/README.md)
+- [Technical Documentation](docs/technical/README.md)
+- [Functional Documentation](docs/functional/README.md)
+- [Getting Started Guide](docs/functional/user-guides/getting-started.md)
+- [System Overview](docs/technical/architecture/system-overview.md)
 
-The daemon runs as a user systemd service. USB access is granted via udev rules (no root required).
-The GUI connects over `$XDG_RUNTIME_DIR/lianli-daemon.sock`.
-The backend talks to the same daemon socket and exposes `/api/*` plus `/api/ws` for the web UI.
+The remaining flat files under `docs/` are transition-era technical references.
+New or updated first-party documentation belongs under `docs/technical/` or `docs/functional/`.
 
-## Developer Documentation
+## Build
 
-For developers extending the project, start here:
+### Prerequisites
 
-- `docs/architecture.md` - overall system layout, runtime topology, request flows, and known limits
-- `docs/backend.md` - backend module overview, request handling, config/profile persistence, and extension points
-- `docs/frontend.md` - frontend structure, state model, event flow, and page/workbench conventions
-- `docs/api.md` - HTTP/WebSocket API contract
-- `docs/deployment.md` - production-style deployment, services, reverse proxy, and diagnostics
-
-Supporting docs for specific areas:
-
-- `docs/backend-config.md`
-- `docs/event-model.md`
-- `docs/future-extensions.md`
-- `docs/polling-fallback.md`
-- `docs/profile-model.md`
-- `docs/profile-storage.md`
-- `docs/container-tests.md`
-
-## Building
-
-### Arch Linux (AUR)
-
-```bash
-yay -S lianli-linux-git
-```
-
-Or with any AUR helper (`paru`, `trizen`, etc.). This installs both binaries, udev rules, systemd service (auto-enabled), desktop entry, and icons. After installing, reboot or run:
-```bash
-sudo udevadm control --reload-rules && sudo udevadm trigger
-systemctl --user daemon-reload && systemctl --user start lianli-daemon
-```
-
-### Manually
-#### Prerequisites
-1) clone the repo and submodules
-```bash
-git clone --recurse-submodules https://github.com/sgtaziz/lian-li-linux.git && cd lian-li-linux
-```
-> if you cloned the project without the --recurse-submodules flag, run: git submodule update --init --recursive
-
-2) install dependencies
-- **Rust** (stable, 1.75+)
-- **ffmpeg** and **ffprobe** in `PATH` (for video/GIF decoding)
-- **System libraries:**
+- Rust stable
+- Node.js and npm for `frontend/`
+- `ffmpeg` and `ffprobe` in `PATH`
+- Platform libraries for HID and USB access
 
 ```bash
 # Arch
-sudo pacman -S hidapi libusb ffmpeg
+sudo pacman -S hidapi libusb ffmpeg nodejs npm
 
 # Ubuntu / Debian
-sudo apt install libhidapi-dev libusb-1.0-0-dev libudev-dev libfontconfig-dev ffmpeg
+sudo apt install libhidapi-dev libusb-1.0-0-dev libudev-dev libfontconfig-dev ffmpeg nodejs npm
 
 # Fedora
-sudo dnf install hidapi-devel libusb1-devel fontconfig-devel ffmpeg
+sudo dnf install hidapi-devel libusb1-devel fontconfig-devel ffmpeg nodejs npm
 ```
 
-3) build the project
+### Rust services and CLI
+
 ```bash
-cargo build --release
+cargo build --release -p lianli-daemon -p lianli-backend -p lianli-cli
 ```
 
-### With Docker
+### Frontend
 
-1) build the docker image
 ```bash
-docker build -f docker/build.Dockerfile -t lianli-linux-builder \
-  --build-arg USER_ID="$(id -u)" \
-  --build-arg GROUP_ID="$(id -g)" \
-  .
+cd frontend
+npm ci --no-audit --no-fund
+npm run build
 ```
-2) build the project
+
+### Docker builder
+
 ```bash
+docker build -f docker/build.Dockerfile -t lianli-linux-builder .
 docker run --rm -it \
   -v "$PWD:/work" \
   -v "$PWD/target:/work/target" \
@@ -137,13 +114,9 @@ docker run --rm -it \
   lianli-linux-builder
 ```
 
-### Binaries: `target/release/lianli-daemon` and `target/release/lianli-gui`
-
 ## Installation
 
-### 1. udev rules
-
-Required so the daemon can access USB devices without root:
+### 1. Install udev rules
 
 ```bash
 sudo cp udev/99-lianli.rules /etc/udev/rules.d/
@@ -151,95 +124,52 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-### 2. Daemon
+### 2. Install daemon and backend
 
 ```bash
-# Copy binary
+mkdir -p ~/.local/bin ~/.config/systemd/user
 cp target/release/lianli-daemon ~/.local/bin/
-
-# Install and start user systemd service
-mkdir -p ~/.config/systemd/user
+cp target/release/lianli-backend ~/.local/bin/
 cp systemd/lianli-daemon.service ~/.config/systemd/user/
+cp systemd/lianli-backend.service ~/.config/systemd/user/
+cp systemd/lianli-stack.target ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now lianli-daemon
+systemctl --user enable --now lianli-stack.target
 ```
 
-A default config is created automatically at `~/.config/lianli/config.json` on first run.
+The daemon reads `~/.config/lianli/config.json`.
+The backend reads `~/.config/lianli/backend.json`.
 
-### 3. GUI
+### 3. Serve the frontend
 
-```bash
-cp target/release/lianli-gui ~/.local/bin/
+Build the frontend and serve `frontend/dist` through a reverse proxy or static web server that also proxies:
 
-# Install icons
-for size in 32x32 128x128 256x256; do mkdir -p ~/.local/share/icons/hicolor/$size/apps; done
-cp assets/icons/32x32.png ~/.local/share/icons/hicolor/32x32/apps/lianli-gui.png
-cp assets/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/lianli-gui.png
-cp assets/icons/128x128@2x.png ~/.local/share/icons/hicolor/256x256/apps/lianli-gui.png
+- `/api/*` to the backend HTTP service
+- `/api/ws` to the backend WebSocket endpoint
 
-# Install desktop entry
-cp lianli-gui.desktop ~/.local/share/applications/
-update-desktop-database ~/.local/share/applications/
-```
-
-## Configuration
-
-The daemon reads `~/.config/lianli/config.json`. The GUI edits this file via the daemon's IPC socket.
-The web backend config file, auth modes, and environment overrides are documented in `docs/backend-config.md`.
-A production-style LAN deployment guide is documented in `docs/deployment.md`.
-Shipped systemd artifacts now include `systemd/lianli-daemon.service`, `systemd/lianli-backend.service`, and `systemd/lianli-stack.target`.
-
-### LCD Streaming
-
-Each LCD entry specifies a target device (by serial), media type, and orientation:
-
-| Type | Description |
-|------|-------------|
-| `image` | Static image (JPEG, PNG, BMP, GIF) |
-| `video` | Video file (decoded frame-by-frame via ffmpeg) |
-| `gif` | Animated GIF |
-| `color` | Solid RGB color |
-| `sensor` | Live sensor gauge (CPU temp, GPU temp, etc.) |
-
-### Fan Curves
-
-Fan curves map a temperature source (any shell command) to a speed percentage.
-Points are linearly interpolated; temperatures outside the curve range clamp to the nearest point's speed.
-
-### Fan Speed Modes
-
-| Mode | Description |
-|------|-------------|
-| `0` | Off (0% PWM) |
-| `"curve-name"` | Follow a named fan curve |
-| `1-255` | Constant PWM duty (1=0.4%, 128=50%, 255=100%) |
-| `"__mb_sync__"` | Mirror motherboard PWM signal (hardware passthrough) |
+Deployment details live in [docs/deployment.md](docs/deployment.md).
 
 ## Troubleshooting
 
-**Daemon won't start / no devices found:**
-```bash
-# Check udev rules are loaded
-sudo udevadm test /sys/bus/usb/devices/<your-device>
+**Daemon not seeing devices**
 
-# Check daemon logs
+```bash
 journalctl --user -u lianli-daemon -f
+sudo udevadm test /sys/bus/usb/devices/<your-device>
 ```
 
-**GUI says "Daemon offline":**
+**Backend unavailable**
+
 ```bash
-# Verify daemon is running
-systemctl --user status lianli-daemon
-
-# Check socket exists
-ls -la $XDG_RUNTIME_DIR/lianli-daemon.sock
+systemctl --user status lianli-backend
+journalctl --user -u lianli-backend -f
 ```
 
-**Permission denied on USB device:**
-```bash
-# Re-trigger udev after plugging in device
-sudo udevadm trigger
-```
+**Web UI cannot connect**
+
+- confirm the backend is reachable on the configured bind address
+- confirm the reverse proxy forwards `/api/*` and `/api/ws`
+- rebuild and redeploy `frontend/dist` after frontend changes
 
 ## License
 

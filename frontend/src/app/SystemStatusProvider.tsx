@@ -57,11 +57,16 @@ export function SystemStatusProvider({ children }: PropsWithChildren) {
     };
   }, [resource.refresh]);
 
-  useBackendEventSubscription((event) => {
-    if (event.type === "daemon.connected" || event.type === "daemon.disconnected") {
-      void resource.refresh({ background: true });
-    }
-  });
+  useBackendEventSubscription(
+    useCallback(
+      (event) => {
+        if (event.type === "daemon.connected" || event.type === "daemon.disconnected") {
+          void resource.refresh({ background: true });
+        }
+      },
+      [resource.refresh],
+    ),
+  );
 
   return (
     <SystemStatusContext.Provider

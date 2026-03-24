@@ -4,16 +4,14 @@ import { SettingsPage } from "./SettingsPage";
 import { renderAtRoute } from "../test/render";
 
 describe("SettingsPage", () => {
-  it("renders the current placeholder route and updates the document title", () => {
+  it("renders a small system page", () => {
     renderAtRoute(<SettingsPage />, {
       initialPath: "/settings",
       routePath: "/settings",
     });
 
-    expect(screen.getByText("Runtime and system settings")).toBeInTheDocument();
-    expect(screen.getByText("Planned controls")).toBeInTheDocument();
-    expect(screen.getByText("Backend runtime panel")).toBeInTheDocument();
-    expect(screen.getByText("Daemon reachability panel")).toBeInTheDocument();
+    expect(screen.getByText("Settings")).toBeInTheDocument();
+    expect(screen.getByText("Allgemeine Einstellungen")).toBeInTheDocument();
     expect(document.title).toBe("Settings - Lian Li Control Surface");
   });
 });

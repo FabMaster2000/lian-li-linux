@@ -1,5 +1,6 @@
 use crate::errors::ApiError;
 use crate::models::ProfileDocument;
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,27 @@ use std::sync::{Arc, Mutex};
 pub struct ProfileStore {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InventoryPresentation {
+    pub device_presentations: HashMap<String, DevicePresentationRecord>,
+    pub controller_labels: HashMap<String, Option<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DevicePresentationRecord {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub ui_order: Option<u32>,
+    pub physical_role: Option<String>,
+    pub cluster_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ControllerLabelRecord {
+    controller_id: String,
+    label: Option<String>,
 }
 
 impl ProfileStore {
@@ -98,6 +120,84 @@ impl ProfileStore {
         self.write_unlocked(&file)
     }
 
+    pub fn inventory_presentation(&self) -> Result<InventoryPresentation, ApiError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ApiError::Internal("profile store lock poisoned".to_string()))?;
+        let file = self.read_unlocked()?;
+
+        Ok(InventoryPresentation {
+            device_presentations: file
+                .device_presentations
+                .into_iter()
+                .map(|record| (record.device_id.clone(), record))
+                .collect(),
+            controller_labels: file
+                .controller_labels
+                .into_iter()
+                .map(|record| (record.controller_id, record.label))
+                .collect(),
+        })
+    }
+
+    pub fn upsert_device_presentation(
+        &self,
+        presentation: DevicePresentationRecord,
+    ) -> Result<DevicePresentationRecord, ApiError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ApiError::Internal("profile store lock poisoned".to_string()))?;
+        let mut file = self.read_unlocked()?;
+
+        if let Some(existing) = file
+            .device_presentations
+            .iter_mut()
+            .find(|existing| existing.device_id == presentation.device_id)
+        {
+            *existing = presentation.clone();
+        } else {
+            file.device_presentations.push(presentation.clone());
+        }
+
+        file.device_presentations
+            .sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        self.write_unlocked(&file)?;
+        Ok(presentation)
+    }
+
+    pub fn upsert_controller_label(
+        &self,
+        controller_id: &str,
+        label: Option<String>,
+    ) -> Result<(), ApiError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ApiError::Internal("profile store lock poisoned".to_string()))?;
+        let mut file = self.read_unlocked()?;
+
+        if let Some(existing) = file
+            .controller_labels
+            .iter_mut()
+            .find(|existing| existing.controller_id == controller_id)
+        {
+            existing.label = label.clone();
+        } else {
+            file.controller_labels.push(ControllerLabelRecord {
+                controller_id: controller_id.to_string(),
+                label: label.clone(),
+            });
+        }
+
+        file.controller_labels
+            .retain(|record| record.label.as_ref().is_some_and(|value| !value.is_empty()));
+        file.controller_labels
+            .sort_by(|left, right| left.controller_id.cmp(&right.controller_id));
+        self.write_unlocked(&file)
+    }
+
     fn read_unlocked(&self) -> Result<ProfileStoreFile, ApiError> {
         if !self.path.exists() {
             return Ok(ProfileStoreFile::default());
@@ -168,13 +268,19 @@ struct ProfileStoreFile {
     version: u32,
     #[serde(default)]
     profiles: Vec<ProfileDocument>,
+    #[serde(default)]
+    device_presentations: Vec<DevicePresentationRecord>,
+    #[serde(default)]
+    controller_labels: Vec<ControllerLabelRecord>,
 }
 
 impl Default for ProfileStoreFile {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             profiles: Vec::new(),
+            device_presentations: Vec::new(),
+            controller_labels: Vec::new(),
         }
     }
 }

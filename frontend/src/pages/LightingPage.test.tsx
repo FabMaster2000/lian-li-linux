@@ -1,75 +1,69 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LightingPage } from "./LightingPage";
 import { renderAtRoute } from "../test/render";
-import type { DeviceView, LightingStateResponse } from "../types/api";
-import { listDevices } from "../services/devices";
-import { getLightingState, setLightingEffect } from "../services/lighting";
+import { useMvpRgbPageData } from "../hooks/useMvpRgbPageData";
+import type { MvpCluster } from "../features/mvpClusters";
 
-vi.mock("../services/devices", () => ({
-  listDevices: vi.fn(),
+vi.mock("../hooks/useMvpRgbPageData", () => ({
+  useMvpRgbPageData: vi.fn(),
 }));
 
-vi.mock("../services/lighting", () => ({
-  getLightingState: vi.fn(),
-  setLightingEffect: vi.fn(),
-}));
+const useMvpRgbPageDataMock = vi.mocked(useMvpRgbPageData);
 
-const listDevicesMock = vi.mocked(listDevices);
-const getLightingStateMock = vi.mocked(getLightingState);
-const setLightingEffectMock = vi.mocked(setLightingEffect);
-
-function rgbDevice(id: string, name: string): DeviceView {
+function cluster(): MvpCluster {
   return {
-    id,
-    name,
-    family: "SlInf",
-    online: true,
-    capabilities: {
-      has_fan: true,
-      has_rgb: true,
-      has_lcd: false,
-      has_pump: false,
-      fan_count: 4,
-      per_fan_control: false,
-      mb_sync_support: false,
-      rgb_zone_count: 2,
+    id: "desk-cluster",
+    label: "Desk cluster",
+    deviceIds: ["wireless:one"],
+    primaryDeviceId: "wireless:one",
+    fanCount: 4,
+    fanType: "SlInf",
+    status: "healthy",
+    devices: [],
+    primaryDevice: {
+      id: "wireless:one",
+      name: "wireless:one",
+      display_name: "Desk cluster",
+      family: "SlInf",
+      online: true,
+      ui_order: 10,
+      physical_role: "Wireless cluster",
+      capability_summary: "RGB | Fan",
+      current_mode_summary: "Ready",
+      controller: {
+        id: "wireless:mesh",
+        label: "Desk mesh",
+        kind: "wireless_mesh",
+      },
+      wireless: {
+        transport: "wireless",
+        channel: 8,
+        group_id: "desk-cluster",
+        group_label: "Desk cluster",
+        binding_state: "connected",
+        master_mac: "aa:bb",
+      },
+      health: {
+        level: "healthy",
+        summary: "Healthy",
+      },
+      capabilities: {
+        has_fan: true,
+        has_rgb: true,
+        has_lcd: false,
+        has_pump: false,
+        fan_count: 4,
+        per_fan_control: false,
+        mb_sync_support: false,
+        rgb_zone_count: 2,
+      },
+      state: {
+        fan_rpms: [900, 910, 920, 930],
+        coolant_temp: null,
+        streaming_active: false,
+      },
     },
-    state: {
-      fan_rpms: [900, 910, 920, 930],
-      coolant_temp: null,
-      streaming_active: false,
-    },
-  };
-}
-
-function lightingState(
-  deviceId: string,
-  zones: LightingStateResponse["zones"] = [
-    {
-      zone: 0,
-      effect: "Static",
-      colors: ["#112233"],
-      speed: 2,
-      brightness_percent: 75,
-      direction: "Clockwise",
-      scope: "All",
-    },
-    {
-      zone: 1,
-      effect: "Rainbow",
-      colors: ["#445566"],
-      speed: 4,
-      brightness_percent: 25,
-      direction: "Up",
-      scope: "Inner",
-    },
-  ],
-): LightingStateResponse {
-  return {
-    device_id: deviceId,
-    zones,
   };
 }
 
@@ -78,290 +72,102 @@ describe("LightingPage", () => {
     vi.clearAllMocks();
   });
 
-  it("renders device and zone data from the backend", async () => {
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    expect(screen.getByText("Lighting workbench")).toBeInTheDocument();
-
-    await waitFor(() => {
-      expect(screen.getByRole("combobox", { name: "Device" })).toHaveValue("wireless:one");
-      expect(screen.getByRole("combobox", { name: "Effect" })).toBeEnabled();
-    });
-
-    expect(screen.getByRole("combobox", { name: "Zone" })).toHaveValue("0");
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Static");
-    expect(await screen.findByLabelText("Lighting color picker")).toHaveValue("#112233");
-    expect(screen.getByText("Other zones")).toBeInTheDocument();
-    expect(screen.queryByText(/^Colors$/)).not.toBeInTheDocument();
-  });
-
-  it("updates the form when a different zone is selected", async () => {
-    const user = userEvent.setup();
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole("combobox", { name: "Zone" })).toBeEnabled();
-      expect(screen.getByRole("combobox", { name: "Zone" })).toHaveValue("0");
-    });
-
-    await user.selectOptions(screen.getByRole("combobox", { name: "Zone" }), "1");
-
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Rainbow");
-    expect(screen.getByLabelText("Lighting color picker")).toHaveValue("#445566");
-    expect(screen.getByRole("slider")).toHaveValue("25");
-  });
-
-  it("applies lighting changes and shows a success state", async () => {
-    const user = userEvent.setup();
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-    setLightingEffectMock.mockResolvedValue({
-      device_id: "wireless:one",
-      zones: [
-        {
-          zone: 0,
-          effect: "Breathing",
-          colors: ["#abcdef"],
-          speed: 2,
-          brightness_percent: 60,
-          direction: "Clockwise",
-          scope: "All",
-        },
-      ],
-    });
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() => {
-      expect(screen.getByRole("combobox", { name: "Effect" })).toBeEnabled();
-      expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Static");
-    });
-
-    await user.selectOptions(screen.getByRole("combobox", { name: "Effect" }), "Breathing");
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Breathing");
-    fireEvent.change(screen.getByLabelText("Lighting color picker"), {
-      target: { value: "#abcdef" },
-    });
-    fireEvent.change(screen.getByRole("slider"), {
-      target: { value: "60" },
-    });
-    await user.click(screen.getByRole("button", { name: "Apply lighting" }));
-
-    await waitFor(() =>
-      expect(setLightingEffectMock).toHaveBeenCalledWith("wireless:one", {
-        zone: 0,
-        effect: "Breathing",
-        brightness: 60,
-        color: { hex: "#abcdef" },
-      }),
-    );
-
-    expect(screen.getByText("Lighting updated.")).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Breathing");
-  });
-
-  it("shows backend errors for failed apply requests", async () => {
-    const user = userEvent.setup();
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-    setLightingEffectMock.mockRejectedValue(new Error("bad request: unsupported effect"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Apply lighting" })).toBeEnabled(),
-    );
-
-    await user.click(screen.getByRole("button", { name: "Apply lighting" }));
-
-    expect(await screen.findByText("Lighting action failed.")).toBeInTheDocument();
-    expect(screen.getByText("bad request: unsupported effect")).toBeInTheDocument();
-  });
-
-  it("hides the zone overview when the backend only reports one zone", async () => {
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(
-      lightingState("wireless:one", [
-        {
-          zone: 0,
-          effect: "Static",
-          colors: ["#112233"],
-          speed: 2,
-          brightness_percent: 75,
-          direction: "Clockwise",
-          scope: "All",
-        },
-      ]),
-    );
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Static"),
-    );
-
-    expect(screen.queryByText("Other zones")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Use this zone" })).not.toBeInTheDocument();
-  });
-
-  it("refreshes readonly fields in the background without overwriting the form", async () => {
-    const user = userEvent.setup();
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock
-      .mockResolvedValueOnce(lightingState("wireless:one"))
-      .mockImplementationOnce(
-        () =>
-          new Promise<LightingStateResponse>((resolve) => {
-            setTimeout(() => {
-              resolve(
-                lightingState("wireless:one", [
-                  {
-                    zone: 0,
-                    effect: "Static",
-                    colors: ["#778899"],
-                    speed: 2,
-                    brightness_percent: 10,
-                    direction: "Clockwise",
-                    scope: "All",
-                  },
-                  {
-                    zone: 1,
-                    effect: "Rainbow",
-                    colors: ["#445566"],
-                    speed: 4,
-                    brightness_percent: 25,
-                    direction: "Up",
-                    scope: "Inner",
-                  },
-                ]),
-              );
-            }, 20);
-          }),
-      );
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Static"),
-    );
-
-    await user.selectOptions(screen.getByRole("combobox", { name: "Effect" }), "Breathing");
-    fireEvent.change(screen.getByLabelText("Lighting color picker"), {
-      target: { value: "#abcdef" },
-    });
-    fireEvent.change(screen.getByRole("slider"), {
-      target: { value: "60" },
-    });
-
-    await user.click(screen.getByRole("button", { name: "Reload lighting" }));
-
-    expect(screen.getByRole("button", { name: "Refreshing..." })).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Effect" })).toBeEnabled();
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Breathing");
-    expect(screen.getByLabelText("Lighting color picker")).toHaveValue("#abcdef");
-    expect(screen.getByRole("slider")).toHaveValue("60");
-
-    expect((await screen.findAllByText("#778899")).length).toBeGreaterThan(0);
-    expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Breathing");
-    expect(screen.getByLabelText("Lighting color picker")).toHaveValue("#abcdef");
-    expect(screen.getByRole("slider")).toHaveValue("60");
-  });
-
-  it("shows only readonly backend fields in the live state card", async () => {
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() =>
-      expect(screen.getByRole("heading", { name: "Live zone state" })).toBeInTheDocument(),
-    );
-
-    const liveStateCard = screen
-      .getByRole("heading", { name: "Live zone state" })
-      .closest("article");
-
-    expect(liveStateCard).not.toBeNull();
-
-    const liveState = within(liveStateCard as HTMLElement);
-    expect(liveState.getByText("Speed")).toBeInTheDocument();
-    expect(liveState.getByText("Direction")).toBeInTheDocument();
-    expect(liveState.getByText("Scope")).toBeInTheDocument();
-    expect(liveState.queryByText("Colors")).not.toBeInTheDocument();
-    expect(liveState.queryByText("Brightness")).not.toBeInTheDocument();
-  });
-
-  it("requires an explicit device selection on the generic route", async () => {
-    const user = userEvent.setup();
-    listDevicesMock.mockResolvedValue([rgbDevice("wireless:one", "Controller One")]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting",
-      routePath: "/lighting",
-    });
-
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "Device" })).toHaveValue(""),
-    );
-
-    expect(screen.getByText("Select an RGB-capable device to start editing.")).toBeInTheDocument();
-    expect(getLightingStateMock).not.toHaveBeenCalled();
-
-    await user.selectOptions(screen.getByRole("combobox", { name: "Device" }), "wireless:one");
-
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "Effect" })).toHaveValue("Static"),
-    );
-  });
-
-  it("shows an offline warning and disables lighting edits for offline devices", async () => {
-    listDevicesMock.mockResolvedValue([
-      {
-        ...rgbDevice("wireless:one", "Controller One"),
-        online: false,
+  it("renders the reduced RGB MVP surface", () => {
+    useMvpRgbPageDataMock.mockReturnValue({
+      clusters: [cluster()],
+      selectedClusterId: "desk-cluster",
+      setSelectedClusterId: vi.fn(),
+      selectedCluster: cluster(),
+      lightingState: {
+        device_id: "wireless:one",
+        zones: [
+          {
+            zone: 0,
+            effect: "Static",
+            colors: ["#112233"],
+            speed: 2,
+            brightness_percent: 100,
+            direction: "Clockwise",
+            scope: "All",
+            smoothness_ms: 0,
+          },
+        ],
       },
-    ]);
-    getLightingStateMock.mockResolvedValue(lightingState("wireless:one"));
-
-    renderAtRoute(<LightingPage />, {
-      initialPath: "/lighting?device=wireless%3Aone",
-      routePath: "/lighting",
+      loading: false,
+      refreshing: false,
+      stateLoading: false,
+      stateRefreshing: false,
+      applying: false,
+      error: null,
+      success: null,
+      effect: "Meteor" as const,
+      setEffect: vi.fn(),
+      color: "#aabbcc",
+      setColor: vi.fn(),
+      routeDraft: [
+        { key: "wireless:one::1", deviceId: "wireless:one", fanIndex: 1, label: "Desk cluster · Lüfter 1" },
+        { key: "wireless:one::2", deviceId: "wireless:one", fanIndex: 2, label: "Desk cluster · Lüfter 2" },
+      ],
+      reorderRouteEntry: vi.fn(),
+      dirty: true,
+      rgbSummary: "Static #112233",
+      refresh: vi.fn(),
+      applyChanges: vi.fn(),
+      resetDraft: vi.fn(),
     });
 
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "Device" })).toHaveValue("wireless:one"),
-    );
+    renderAtRoute(<LightingPage />, {
+      initialPath: "/rgb?cluster=desk-cluster",
+      routePath: "/rgb",
+    });
 
-    expect(screen.getByText("Device offline.")).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Effect" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Apply lighting" })).toBeDisabled();
+    expect(screen.getByText("RGB")).toBeInTheDocument();
+    expect(screen.getByText("Aktueller RGB-Status")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "RGB-Einstellung" })).toBeInTheDocument();
+    expect(screen.getByText("Static #112233")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Übernehmen" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Lüfterreihenfolge" })).toBeInTheDocument();
+    expect(screen.getByText("Desk cluster · Lüfter 1")).toBeInTheDocument();
+    expect(screen.getByText("Desk cluster · Lüfter 2")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Auf alle Cluster übertragen" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Colors and effects")).not.toBeInTheDocument();
+    expect(screen.queryByText("Quick presets")).not.toBeInTheDocument();
+  });
+
+  it("renders the no-data state when no paired RGB clusters are available", () => {
+    useMvpRgbPageDataMock.mockReturnValue({
+      clusters: [],
+      selectedClusterId: "",
+      setSelectedClusterId: vi.fn(),
+      selectedCluster: null,
+      lightingState: null,
+      loading: false,
+      refreshing: false,
+      stateLoading: false,
+      stateRefreshing: false,
+      applying: false,
+      error: null,
+      success: null,
+      effect: "Meteor" as const,
+      setEffect: vi.fn(),
+      color: "#ffffff",
+      setColor: vi.fn(),
+      routeDraft: [],
+      reorderRouteEntry: vi.fn(),
+      dirty: false,
+      rgbSummary: "n/a",
+      refresh: vi.fn(),
+      applyChanges: vi.fn(),
+      resetDraft: vi.fn(),
+    });
+
+    renderAtRoute(<LightingPage />, {
+      initialPath: "/rgb",
+      routePath: "/rgb",
+    });
+
+    expect(screen.getByText("Keine gekoppelten Geräte")).toBeInTheDocument();
   });
 });

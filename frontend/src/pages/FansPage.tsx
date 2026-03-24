@@ -1,291 +1,300 @@
 import { useEffect } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
+import { ActionBar } from "../components/feedback/ActionBar";
+import { EmptyState } from "../components/feedback/EmptyState";
+import { InlineNotice } from "../components/feedback/InlineNotice";
+import { SliderField } from "../components/forms/SliderField";
 import { PageIntro } from "../components/PageIntro";
-import { SliderField } from "../components/SliderField";
+import { Panel } from "../components/ui/Panel";
+import { StatusBadge } from "../components/ui/StatusBadge";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
-import { useFansWorkbenchData } from "../hooks/useFansWorkbenchData";
-import type { FanStateResponse } from "../types/api";
-
-function summarizeMode(fanState: FanStateResponse | null) {
-  if (!fanState || fanState.slots.length === 0) {
-    return "n/a";
-  }
-
-  const modes = [...new Set(fanState.slots.map((slot) => slot.mode))];
-  return modes.length === 1 ? modes[0] : "mixed";
-}
-
-function summarizePercent(fanState: FanStateResponse | null) {
-  if (!fanState || fanState.slots.length === 0) {
-    return "n/a";
-  }
-
-  const percents = fanState.slots
-    .map((slot) => slot.percent)
-    .filter((percent): percent is number => typeof percent === "number");
-
-  if (percents.length === 0) {
-    return "n/a";
-  }
-
-  return percents.every((percent) => percent === percents[0]) ? `${percents[0]}%` : "mixed";
-}
-
-function summarizeRpms(rpms: number[] | null) {
-  return rpms && rpms.length > 0 ? rpms.join(" / ") : "n/a";
-}
-
-function slotRpm(fanState: FanStateResponse | null, slot: number) {
-  return fanState?.rpms?.[slot - 1] ?? null;
-}
+import { useMvpFansPageData } from "../hooks/useMvpFansPageData";
+import { summarizeFanRpm } from "../features/mvpClusters";
 
 export function FansPage() {
   useDocumentTitle("Fans - Lian Li Control Surface");
   const [searchParams, setSearchParams] = useSearchParams();
+  const requestedClusterId = searchParams.get("cluster");
   const requestedDeviceId = searchParams.get("device");
   const {
-    devices,
-    selectedDeviceId,
-    setSelectedDeviceId,
+    clusters,
+    selectedClusterId,
+    setSelectedClusterId,
+    selectedCluster,
     fanState,
-    formPercent,
-    setFormPercent,
     loading,
+    refreshing,
     stateLoading,
     stateRefreshing,
-    submitting,
+    applying,
     error,
     success,
+    dirty,
+    draft,
     refresh,
     applyChanges,
-  } = useFansWorkbenchData(requestedDeviceId);
-  const selectedDevice = devices.find((device) => device.id === selectedDeviceId) ?? null;
-  const selectedDeviceOffline = selectedDevice !== null && !selectedDevice.online;
+    resetDraft,
+    setMode,
+    setManualPercent,
+    setCurveSource,
+    updateCurvePoint,
+    addCurvePoint,
+    removeCurvePoint,
+  } = useMvpFansPageData(requestedClusterId, requestedDeviceId);
 
   useEffect(() => {
-    if (!selectedDeviceId || requestedDeviceId === selectedDeviceId) {
-      return;
-    }
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        if (selectedClusterId) {
+          next.set("cluster", selectedClusterId);
+        } else {
+          next.delete("cluster");
+        }
+        next.delete("device");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [selectedClusterId, setSearchParams]);
 
-    setSearchParams((current) => {
-      const next = new URLSearchParams(current);
-      next.set("device", selectedDeviceId);
-      return next;
-    }, { replace: true });
-  }, [requestedDeviceId, selectedDeviceId, setSearchParams]);
+  const applyDisabled =
+    !selectedCluster ||
+    selectedCluster.status === "offline" ||
+    applying ||
+    stateLoading;
+  const visibleRpms =
+    selectedCluster && fanState?.device_id === selectedCluster.primaryDeviceId
+      ? fanState.rpms
+      : selectedCluster?.primaryDevice.state.fan_rpms ?? null;
 
   return (
     <main className="page-shell">
       <PageIntro
         eyebrow="fans"
-        title="Cooling console"
-        description="Set a fixed cooling percentage for the selected fan-capable device. Readonly fan state and telemetry can refresh without overwriting your draft value."
+        title="Fans"
+        description="Cluster auswählen und entweder einen festen Prozentwert oder eine temperaturbasierte Lüfterkurve setzen."
         aside={
-          <div className="dashboard-aside">
-            <dl className="runtime-grid">
-              <div>
-                <dt>Device</dt>
-                <dd>{selectedDevice ? selectedDevice.name : loading ? "loading" : "none"}</dd>
-              </div>
-              <div>
-                <dt>Current value</dt>
-                <dd>{summarizePercent(fanState)}</dd>
-              </div>
-              <div>
-                <dt>Live state</dt>
-                <dd>
-                  {submitting
-                    ? "applying"
-                    : stateLoading
-                      ? "loading"
-                      : stateRefreshing
-                        ? "refreshing"
-                        : fanState
-                          ? "synced"
-                          : "idle"}
-                </dd>
-              </div>
-            </dl>
-
-            <div className="device-actions">
-              <button className="refresh-button" onClick={() => void refresh()} type="button">
-                {stateRefreshing ? "Refreshing..." : "Reload fans"}
-              </button>
-              {selectedDeviceId ? (
-                <Link className="button-link" to={`/devices/${encodeURIComponent(selectedDeviceId)}`}>
-                  Device detail
-                </Link>
-              ) : null}
-            </div>
-          </div>
+          <button className="refresh-button" onClick={() => void refresh()} type="button">
+            {refreshing || stateRefreshing ? "Aktualisiere..." : "Aktualisieren"}
+          </button>
         }
       />
 
       {error ? (
-        <section className="error-banner" role="alert">
-          <strong>Fan action failed.</strong>
-          <span>{error}</span>
-        </section>
-      ) : null}
-
-      {selectedDeviceOffline ? (
-        <section className="warning-banner" role="status">
-          <strong>Device offline.</strong>
-          <span>Fan changes are disabled until the selected device is online again.</span>
-        </section>
+        <InlineNotice tone="error" title="Lüfterseite konnte nicht geladen werden">
+          {error}
+        </InlineNotice>
       ) : null}
 
       {success ? (
-        <section className="success-banner" role="status">
-          <strong>Fan speed updated.</strong>
-          <span>{success}</span>
-        </section>
+        <InlineNotice tone="success" title="Lüftereinstellungen gespeichert">
+          {success}
+        </InlineNotice>
       ) : null}
 
-      <section className="fans-workbench">
-        <article className="fan-control-card">
-          <div className="content-panel__header">
-            <h2>Manual control</h2>
-            <p>Applies the same fixed percentage to all reported fan slots of the selected device.</p>
-          </div>
+      {selectedCluster?.status === "offline" ? (
+        <InlineNotice tone="warning" title="Gerät offline">
+          Der ausgewählte Cluster ist aktuell offline.
+        </InlineNotice>
+      ) : null}
 
-          <div className="form-grid form-grid--fan">
-            <label className="field-group">
-              <span className="field-group__label">Device</span>
-              <select
-                className="field-input"
-                disabled={loading || devices.length === 0}
-                onChange={(event) => setSelectedDeviceId(event.target.value)}
-                value={selectedDeviceId}
-              >
-                {devices.length === 0 ? <option value="">No fan devices</option> : null}
-                {devices.length > 0 ? <option value="">Choose a device</option> : null}
-                {devices.map((device) => (
-                  <option key={device.id} value={device.id}>
-                    {device.name} ({device.family})
-                  </option>
-                ))}
-              </select>
-            </label>
+      {loading ? (
+        <EmptyState
+          title="Fans lädt"
+          message="Die gekoppelten Cluster und Lüfterwerte werden geladen."
+        />
+      ) : clusters.length === 0 ? (
+        <EmptyState
+          title="Keine gekoppelten Geräte"
+          message="Es sind keine gekoppelten Wireless-Cluster für Fans verfügbar."
+        />
+      ) : (
+        <>
+          <section className="page-main-grid">
+            <Panel
+              className="page-main-grid__primary"
+              eyebrow="cluster"
+              title="Cluster auswählen"
+              description="Nur aktuell gekoppelte Wireless-Cluster sind auswählbar."
+            >
+              <label className="field-group">
+                <span className="field-group__label">Cluster</span>
+                <select
+                  className="field-input"
+                  onChange={(event) => setSelectedClusterId(event.target.value)}
+                  value={selectedClusterId}
+                >
+                  {clusters.map((cluster) => (
+                    <option key={cluster.id} value={cluster.id}>
+                      {cluster.id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </Panel>
 
-            <div className="fan-inline-stat">
-              <span className="field-group__label">Current mode</span>
-              <strong>{summarizeMode(fanState)}</strong>
+            <Panel
+              className="page-main-grid__secondary"
+              eyebrow="live"
+              title="Live-Status"
+              description="Aktueller Zustand des ausgewählten Clusters."
+            >
+              {selectedCluster ? (
+                <dl className="detail-list detail-list--compact">
+                  <div>
+                    <dt>Status</dt>
+                    <dd>
+                      <StatusBadge tone={selectedCluster.status === "healthy" ? "online" : "offline"}>
+                        {selectedCluster.status}
+                      </StatusBadge>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Aktuelle Drehzahl</dt>
+                    <dd>{summarizeFanRpm(visibleRpms)}</dd>
+                  </div>
+                </dl>
+              ) : (
+                <EmptyState
+                  title="Kein Cluster ausgewählt"
+                  message="Bitte zuerst ein Cluster auswählen."
+                />
+              )}
+            </Panel>
+          </section>
+
+          <Panel
+            eyebrow="steuerung"
+            title="Lüftersteuerung"
+            description="Fester Prozentwert oder kompakte Temperaturkurve."
+          >
+            <div className="form-grid">
+              <label className="field-group">
+                <span className="field-group__label">Modus</span>
+                <select
+                  className="field-input"
+                  disabled={!selectedCluster || applying}
+                  onChange={(event) =>
+                    setMode(event.target.value as "manual" | "curve")
+                  }
+                  value={draft.mode}
+                >
+                  <option value="manual">Fester Prozentwert</option>
+                  <option value="curve">Lüfterkurve</option>
+                </select>
+              </label>
             </div>
 
-            <div className="fan-inline-stat">
-              <span className="field-group__label">RPM telemetry</span>
-              <strong>{summarizeRpms(fanState?.rpms ?? null)}</strong>
-            </div>
-          </div>
+            {draft.mode === "manual" ? (
+              <SliderField
+                disabled={!selectedCluster || applyDisabled}
+                label="Fester Prozentwert"
+                onChange={setManualPercent}
+                value={draft.manualPercent}
+              />
+            ) : (
+              <>
+                <div className="form-grid">
+                  <label className="field-group">
+                    <span className="field-group__label">Temperaturquelle</span>
+                    <select
+                      className="field-input"
+                      disabled={!selectedCluster || applyDisabled}
+                      onChange={(event) =>
+                        setCurveSource(event.target.value as "cpu" | "gpu")
+                      }
+                      value={draft.curveSource}
+                    >
+                      <option value="cpu">CPU</option>
+                      <option value="gpu">GPU</option>
+                    </select>
+                  </label>
+                </div>
 
-          <SliderField
-            disabled={!selectedDeviceId || selectedDeviceOffline || stateLoading || submitting}
-            label="Manual percent"
-            onChange={setFormPercent}
-            value={formPercent}
-          />
+                <div className="fan-curve-points">
+                  <div className="fan-curve-points__header">
+                    <strong>Kurvenpunkte</strong>
+                    <button className="button-link" onClick={addCurvePoint} type="button">
+                      Punkt hinzufügen
+                    </button>
+                  </div>
 
-          <p className="fan-control-note">
-            The slider is your editable draft. Reloading updates readonly state but does not reset an
-            unfinished change.
-          </p>
+                  {draft.points.map((point, index) => (
+                    <div className="fan-curve-point-row" key={`${index}-${point.temperature_celsius}`}>
+                      <label className="field-group">
+                        <span className="field-group__label">Temperatur</span>
+                        <input
+                          aria-label={`Curve point ${index + 1} temperature`}
+                          className="field-input"
+                          disabled={!selectedCluster || applyDisabled}
+                          onChange={(event) =>
+                            updateCurvePoint(
+                              index,
+                              "temperature_celsius",
+                              Number(event.target.value),
+                            )
+                          }
+                          step="1"
+                          type="number"
+                          value={point.temperature_celsius}
+                        />
+                      </label>
+                      <label className="field-group">
+                        <span className="field-group__label">Prozent</span>
+                        <input
+                          aria-label={`Curve point ${index + 1} percent`}
+                          className="field-input"
+                          disabled={!selectedCluster || applyDisabled}
+                          onChange={(event) =>
+                            updateCurvePoint(index, "percent", Number(event.target.value))
+                          }
+                          step="1"
+                          type="number"
+                          value={point.percent}
+                        />
+                      </label>
+                      <button
+                        className="button-link"
+                        disabled={!selectedCluster || draft.points.length <= 2 || applyDisabled}
+                        onClick={() => removeCurvePoint(index)}
+                        type="button"
+                      >
+                        Entfernen
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </Panel>
 
-          <div className="device-actions">
+          <ActionBar
+            summary={
+              dirty
+                ? "Es gibt nicht gespeicherte Lüfteränderungen."
+                : "Keine ausstehenden Lüfteränderungen."
+            }
+          >
             <button
-              className="refresh-button"
-              disabled={!selectedDeviceId || selectedDeviceOffline || stateLoading || submitting}
+              className="button-link button-link--primary"
+              disabled={applyDisabled}
               onClick={() => void applyChanges()}
               type="button"
             >
-              {submitting ? "Applying..." : "Apply fan speed"}
+              {applying ? "Speichere..." : "Übernehmen"}
             </button>
-          </div>
-        </article>
-
-        <article className="fan-preview-card">
-          <div className="content-panel__header">
-            <h2>Live fan state</h2>
-            <p>Readonly backend slot state and telemetry for the current device.</p>
-          </div>
-
-          {stateLoading && !fanState ? (
-            <div className="empty-state">
-              <h3>Loading fan state</h3>
-              <p>The selected device is being refreshed from the backend.</p>
-            </div>
-          ) : fanState ? (
-            <>
-              {stateRefreshing ? (
-                <p className="panel-stack__eyebrow">Readonly fields are refreshing in the background.</p>
-              ) : null}
-              <dl className="detail-list">
-                <div>
-                  <dt>Mode</dt>
-                  <dd>{summarizeMode(fanState)}</dd>
-                </div>
-                <div>
-                  <dt>Configured value</dt>
-                  <dd>{summarizePercent(fanState)}</dd>
-                </div>
-                <div>
-                  <dt>Update interval</dt>
-                  <dd>{fanState.update_interval_ms} ms</dd>
-                </div>
-                <div>
-                  <dt>RPM telemetry</dt>
-                  <dd>{summarizeRpms(fanState.rpms)}</dd>
-                </div>
-              </dl>
-            </>
-          ) : (
-            <div className="empty-state">
-              <h3>No fan state</h3>
-              <p>Select a fan-capable device to start applying a manual speed.</p>
-            </div>
-          )}
-        </article>
-      </section>
-
-      {fanState?.slots.length ? (
-        <section className="detail-section">
-          <div className="panel-stack__header">
-            <div>
-              <p className="panel-stack__eyebrow">slots</p>
-              <h2>Reported fan slots</h2>
-            </div>
-            <p>Per-slot readonly values reported by the backend after the last successful refresh.</p>
-          </div>
-
-          <div className="fan-slot-grid">
-            {fanState.slots.map((slot) => (
-              <article key={slot.slot} className="fan-slot-card">
-                <div className="lighting-zone-card__header">
-                  <div>
-                    <p className="device-card__eyebrow">Slot {slot.slot}</p>
-                    <h3>{slot.mode}</h3>
-                  </div>
-                  {slot.percent !== null ? <span className="capability-chip">{slot.percent}%</span> : null}
-                </div>
-                <dl className="detail-list detail-list--compact">
-                  <div>
-                    <dt>PWM</dt>
-                    <dd>{slot.pwm ?? "n/a"}</dd>
-                  </div>
-                  <div>
-                    <dt>RPM</dt>
-                    <dd>{slotRpm(fanState, slot.slot) ?? "n/a"}</dd>
-                  </div>
-                  <div>
-                    <dt>Curve</dt>
-                    <dd>{slot.curve ?? "n/a"}</dd>
-                  </div>
-                </dl>
-              </article>
-            ))}
-          </div>
-        </section>
-      ) : null}
+            <button
+              className="button-link"
+              disabled={!dirty || applying}
+              onClick={resetDraft}
+              type="button"
+            >
+              Zurücksetzen
+            </button>
+          </ActionBar>
+        </>
+      )}
     </main>
   );
 }

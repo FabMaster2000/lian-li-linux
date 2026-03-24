@@ -73,13 +73,53 @@ pub struct DeviceState {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DeviceControllerContext {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceWirelessContext {
+    pub transport: String,
+    pub channel: Option<u8>,
+    pub group_id: Option<String>,
+    pub group_label: Option<String>,
+    pub binding_state: Option<String>,
+    pub master_mac: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceHealthState {
+    pub level: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DeviceView {
     pub id: String,
     pub name: String,
+    pub display_name: String,
     pub family: String,
     pub online: bool,
+    pub ui_order: u32,
+    pub physical_role: String,
+    pub capability_summary: String,
+    pub current_mode_summary: String,
+    pub controller: DeviceControllerContext,
+    pub wireless: Option<DeviceWirelessContext>,
+    pub health: DeviceHealthState,
     pub capabilities: DeviceCapability,
     pub state: DeviceState,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DevicePresentationUpdateRequest {
+    pub display_name: String,
+    pub ui_order: u32,
+    pub physical_role: Option<String>,
+    pub controller_label: Option<String>,
+    pub cluster_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +148,40 @@ pub struct LightingEffectRequest {
     pub speed: Option<u8>,
     pub brightness: Option<u8>,
     pub color: Option<ColorValue>,
+    #[serde(default)]
+    pub colors: Vec<ColorValue>,
     pub direction: Option<String>,
     pub scope: Option<String>,
+    #[serde(default)]
+    pub smoothness_ms: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LightingApplyRequest {
+    pub target_mode: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+    pub zone_mode: String,
+    #[serde(default)]
+    pub zone: Option<u8>,
+    #[serde(default)]
+    pub sync_selected: bool,
+    pub effect: String,
+    pub brightness: u8,
+    #[serde(default)]
+    pub speed: Option<u8>,
+    #[serde(default)]
+    pub color: Option<ColorValue>,
+    #[serde(default)]
+    pub colors: Vec<ColorValue>,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub smoothness_ms: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +196,71 @@ pub struct LightingStateResponse {
     pub zones: Vec<LightingZoneState>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LightingLedZoneConfigDocument {
+    pub zone: u8,
+    #[serde(default)]
+    pub led_indexes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LightingEffectRouteEntryDocument {
+    pub device_id: String,
+    pub fan_index: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LightingEffectRouteResponse {
+    #[serde(default)]
+    pub route: Vec<LightingEffectRouteEntryDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LightingEffectRouteSaveRequest {
+    #[serde(default)]
+    pub route: Vec<LightingEffectRouteEntryDocument>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WirelessDiscoveryRefreshResponse {
+    pub refreshed: bool,
+    pub device_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WirelessConnectResponse {
+    pub device_id: String,
+    pub connected: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WirelessDisconnectResponse {
+    pub device_id: String,
+    pub disconnected: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LightingApplyDeviceState {
+    pub device_id: String,
+    pub zones: Vec<LightingZoneState>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LightingApplySkip {
+    pub device_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LightingApplyResponse {
+    pub target_mode: String,
+    pub zone_mode: String,
+    pub requested_device_ids: Vec<String>,
+    pub applied_devices: Vec<LightingApplyDeviceState>,
+    pub skipped_devices: Vec<LightingApplySkip>,
+    pub sync_selected: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LightingZoneState {
     pub zone: u8,
@@ -133,6 +270,7 @@ pub struct LightingZoneState {
     pub brightness_percent: u8,
     pub direction: String,
     pub scope: String,
+    pub smoothness_ms: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,12 +279,42 @@ pub struct FanManualRequest {
     pub slot: Option<u8>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FanCurveUpsertRequest {
+    pub name: String,
+    pub temperature_source: String,
+    #[serde(default)]
+    pub points: Vec<FanCurvePointDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FanApplyRequest {
+    pub target_mode: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+    pub mode: String,
+    #[serde(default)]
+    pub percent: Option<u8>,
+    #[serde(default)]
+    pub curve: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FanStateResponse {
     pub device_id: String,
     pub update_interval_ms: u64,
     pub rpms: Option<Vec<u16>>,
     pub slots: Vec<FanSlotState>,
+    pub active_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_curve: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_source: Option<String>,
+    pub mb_sync_enabled: bool,
+    pub start_stop_supported: bool,
+    pub start_stop_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +324,21 @@ pub struct FanSlotState {
     pub percent: Option<u8>,
     pub pwm: Option<u8>,
     pub curve: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FanApplyResponse {
+    pub target_mode: String,
+    pub mode: String,
+    pub requested_device_ids: Vec<String>,
+    pub applied_devices: Vec<FanStateResponse>,
+    pub skipped_devices: Vec<FanApplySkip>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FanApplySkip {
+    pub device_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,6 +359,12 @@ pub struct LightingConfigDocument {
     pub openrgb_server: bool,
     pub openrgb_port: u16,
     #[serde(default)]
+    pub global_led_zones: Vec<LightingLedZoneConfigDocument>,
+    #[serde(default)]
+    pub fan_led_zones: Vec<LightingFanLedZoneConfigDocument>,
+    #[serde(default)]
+    pub effect_route: Vec<LightingEffectRouteEntryDocument>,
+    #[serde(default)]
     pub devices: Vec<LightingDeviceConfigDocument>,
 }
 
@@ -185,15 +374,28 @@ impl Default for LightingConfigDocument {
             enabled: true,
             openrgb_server: false,
             openrgb_port: 6743,
+            global_led_zones: Vec::new(),
+            fan_led_zones: Vec::new(),
+            effect_route: Vec::new(),
             devices: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct LightingFanLedZoneConfigDocument {
+    pub device_id: String,
+    pub fan_index: u8,
+    #[serde(default)]
+    pub zones: Vec<LightingLedZoneConfigDocument>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LightingDeviceConfigDocument {
     pub device_id: String,
     pub motherboard_sync: bool,
+    #[serde(default)]
+    pub led_zones: Vec<LightingLedZoneConfigDocument>,
     #[serde(default)]
     pub zones: Vec<LightingZoneConfigDocument>,
 }
@@ -210,6 +412,8 @@ pub struct LightingZoneConfigDocument {
     pub scope: String,
     pub swap_left_right: bool,
     pub swap_top_bottom: bool,
+    #[serde(default)]
+    pub smoothness_ms: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,7 +435,7 @@ impl Default for FanConfigDocument {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanCurveDocument {
     pub name: String,
     pub temperature_source: String,
@@ -239,7 +443,7 @@ pub struct FanCurveDocument {
     pub points: Vec<FanCurvePointDocument>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanCurvePointDocument {
     pub temperature_celsius: f32,
     pub percent: f32,
@@ -395,3 +599,11 @@ pub struct ProfileApplySkip {
     pub section: String,
     pub reason: String,
 }
+
+
+
+
+
+
+
+

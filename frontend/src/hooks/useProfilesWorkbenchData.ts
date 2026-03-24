@@ -56,7 +56,7 @@ const defaultDraft: ProfileDraft = {
   selectedDeviceIds: [],
   lightingEnabled: true,
   lightingColor: "#223366",
-  lightingEffect: lightingEffectOptions[1]?.value ?? "Static",
+  lightingEffect: lightingEffectOptions[0]?.value ?? "Meteor",
   lightingBrightness: 25,
   fanEnabled: false,
   fanMode: "manual",

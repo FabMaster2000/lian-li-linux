@@ -42,6 +42,28 @@ function device(overrides: Partial<DeviceView> = {}): DeviceView {
   return {
     id: "wireless:one",
     name: "Controller One",
+    display_name: "Controller One",
+    ui_order: 10,
+    physical_role: "Wireless cluster",
+    capability_summary: "1 RGB zone(s) | 4 fan slot(s)",
+    current_mode_summary: "Lighting ready | Cooling telemetry live",
+    controller: {
+      id: "wireless:mesh",
+      label: "Wireless mesh",
+      kind: "wireless_mesh",
+    },
+    wireless: {
+      transport: "wireless",
+      channel: 8,
+      group_id: "wireless:one",
+      group_label: "Controller One",
+    binding_state: "connected",
+    master_mac: "3b:59:87:e5:66:e4",
+    },
+    health: {
+      level: "healthy",
+      summary: "Device inventory healthy",
+    },
     family: "SlInf",
     online: true,
     capabilities: {
@@ -280,3 +302,5 @@ describe("useProfilesWorkbenchData", () => {
     expect(result.current.success).toContain("Night Mode");
   });
 });
+
+

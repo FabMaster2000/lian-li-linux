@@ -1,9 +1,9 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useFansWorkbenchData } from "./useFansWorkbenchData";
-import type { BackendEventEnvelope, DeviceView, FanStateResponse } from "../types/api";
+import type { BackendEventEnvelope, DeviceView, FanCurveDocument, FanStateResponse } from "../types/api";
 import { listDevices } from "../services/devices";
-import { getFanState, setManualFanSpeed } from "../services/fans";
+import { getFanState, listFanCurves, previewFanTemperatureSource } from "../services/fans";
 
 vi.mock("../services/devices", () => ({
   listDevices: vi.fn(),
@@ -11,35 +11,49 @@ vi.mock("../services/devices", () => ({
 
 vi.mock("../services/fans", () => ({
   getFanState: vi.fn(),
-  setManualFanSpeed: vi.fn(),
+  listFanCurves: vi.fn(),
+  previewFanTemperatureSource: vi.fn(),
+  createFanCurve: vi.fn(),
+  updateFanCurve: vi.fn(),
+  deleteFanCurve: vi.fn(),
+  applyFanWorkbench: vi.fn(),
 }));
 
-let latestBackendListener: ((event: BackendEventEnvelope) => void) | null = null;
-
 vi.mock("./useBackendEventSubscription", () => ({
-  useBackendEventSubscription: vi.fn((listener: (event: BackendEventEnvelope) => void) => {
-    latestBackendListener = listener;
-  }),
+  useBackendEventSubscription: vi.fn((_listener: (event: BackendEventEnvelope) => void) => {}),
 }));
 
 const listDevicesMock = vi.mocked(listDevices);
 const getFanStateMock = vi.mocked(getFanState);
-const setManualFanSpeedMock = vi.mocked(setManualFanSpeed);
+const listFanCurvesMock = vi.mocked(listFanCurves);
+const previewFanTemperatureSourceMock = vi.mocked(previewFanTemperatureSource);
 
-function emitBackendEvent(event: Partial<BackendEventEnvelope> & Pick<BackendEventEnvelope, "type">) {
-  latestBackendListener?.({
-    timestamp: "2026-03-14T10:00:00Z",
-    source: "ws",
-    device_id: null,
-    data: {},
-    ...event,
-  });
-}
-
-function device(overrides: Partial<DeviceView>): DeviceView {
+function fanDevice(id: string, name: string, overrides: Partial<DeviceView> = {}): DeviceView {
   return {
-    id: "wireless:test",
-    name: "Test Device",
+    id,
+    name,
+    display_name: name,
+    ui_order: 10,
+    physical_role: "Wireless cluster",
+    capability_summary: "4 fan slot(s)",
+    current_mode_summary: "Cooling telemetry live",
+    controller: {
+      id: "wireless:mesh",
+      label: "Wireless mesh",
+      kind: "wireless_mesh",
+    },
+    wireless: {
+      transport: "wireless",
+      channel: 8,
+      group_id: id,
+      group_label: name,
+    binding_state: "connected",
+    master_mac: "3b:59:87:e5:66:e4",
+    },
+    health: {
+      level: "healthy",
+      summary: "Device inventory healthy",
+    },
     family: "SlInf",
     online: true,
     capabilities: {
@@ -53,7 +67,7 @@ function device(overrides: Partial<DeviceView>): DeviceView {
       rgb_zone_count: 0,
     },
     state: {
-      fan_rpms: [1000, 1010, 1020, 1030],
+      fan_rpms: [900, 910, 920, 930],
       coolant_temp: null,
       streaming_active: false,
     },
@@ -61,192 +75,133 @@ function device(overrides: Partial<DeviceView>): DeviceView {
   };
 }
 
-function fanState(deviceId: string, slots: FanStateResponse["slots"]): FanStateResponse {
+function fanCurve(name: string, temperatureSource = "sensors temperature --source coolant"): FanCurveDocument {
+  return {
+    name,
+    temperature_source: temperatureSource,
+    points: [
+      { temperature_celsius: 28, percent: 25 },
+      { temperature_celsius: 40, percent: 45 },
+      { temperature_celsius: 58, percent: 72 },
+    ],
+  };
+}
+
+function fanState(
+  deviceId: string,
+  mode: FanStateResponse["active_mode"] = "manual",
+  curveName: string | null = null,
+  percent = 40,
+): FanStateResponse {
+  const slotMode = mode === "curve" ? "curve" : mode === "mb_sync" ? "mb_sync" : "manual";
   return {
     device_id: deviceId,
     update_interval_ms: 1000,
-    rpms: [1000, 1010, 1020, 1030],
-    slots,
+    rpms: [900, 910, 920, 930],
+    slots: [
+      {
+        slot: 1,
+        mode: slotMode,
+        percent: slotMode === "manual" ? percent : null,
+        pwm: slotMode === "manual" ? 102 : null,
+        curve: curveName,
+      },
+      {
+        slot: 2,
+        mode: slotMode,
+        percent: slotMode === "manual" ? percent : null,
+        pwm: slotMode === "manual" ? 102 : null,
+        curve: curveName,
+      },
+    ],
+    active_mode: mode,
+    active_curve: curveName,
+    temperature_source: curveName ? "sensors temperature --source coolant" : null,
+    mb_sync_enabled: mode === "mb_sync",
+    start_stop_supported: false,
+    start_stop_enabled: false,
   };
 }
 
 describe("useFansWorkbenchData", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    latestBackendListener = null;
+    previewFanTemperatureSourceMock.mockResolvedValue({
+      source: "cpu",
+      display_name: "CPU temperature",
+      available: true,
+      celsius: 58.2,
+      components: [{ key: "cpu", label: "CPU", kind: "cpu", available: true, celsius: 58.2 }],
+    });
   });
 
   it("does not auto-select a device without an explicit request", async () => {
     listDevicesMock.mockResolvedValue([
-      device({
-        id: "rgb-only",
-        capabilities: { ...device({}).capabilities, has_fan: false },
+      fanDevice("rgb-only", "RGB Only", {
+        capabilities: {
+          ...fanDevice("tmp", "tmp").capabilities,
+          has_fan: false,
+        },
       }),
-      device({ id: "fan-primary", name: "Fan Primary" }),
+      fanDevice("fan-primary", "Fan Primary"),
     ]);
-    getFanStateMock.mockResolvedValue(
-      fanState("fan-primary", [
-        { slot: 1, mode: "manual", percent: 60, pwm: 153, curve: null },
-        { slot: 2, mode: "manual", percent: 60, pwm: 153, curve: null },
-      ]),
-    );
+    listFanCurvesMock.mockResolvedValue([fanCurve("Balanced curve")]);
 
     const { result } = renderHook(() => useFansWorkbenchData(null));
 
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
-      expect(result.current.selectedDeviceId).toBe("");
-    });
+    await waitFor(() => expect(result.current.loading).toBe(false));
 
+    expect(result.current.selectedDeviceId).toBe("");
     expect(result.current.devices).toHaveLength(1);
     expect(result.current.fanState).toBeNull();
     expect(getFanStateMock).not.toHaveBeenCalled();
   });
 
-  it("refreshes readonly fan state without overwriting the slider draft", async () => {
-    listDevicesMock.mockResolvedValue([device({ id: "fan-primary", name: "Fan Primary" })]);
-    getFanStateMock
-      .mockResolvedValueOnce(
-        fanState("fan-primary", [
-          { slot: 1, mode: "manual", percent: 40, pwm: 102, curve: null },
-          { slot: 2, mode: "manual", percent: 40, pwm: 102, curve: null },
-        ]),
-      )
-      .mockResolvedValueOnce(
-        fanState("fan-primary", [
-          { slot: 1, mode: "manual", percent: 75, pwm: 191, curve: null },
-          { slot: 2, mode: "manual", percent: 75, pwm: 191, curve: null },
-        ]),
-      );
+  it("loads the requested device and seeds curve mode from backend state", async () => {
+    listDevicesMock.mockResolvedValue([fanDevice("fan-primary", "Fan Primary")]);
+    listFanCurvesMock.mockResolvedValue([fanCurve("Balanced curve")]);
+    getFanStateMock.mockResolvedValue(fanState("fan-primary", "curve", "Balanced curve"));
 
     const { result } = renderHook(() => useFansWorkbenchData("fan-primary"));
-    await waitFor(() => expect(result.current.selectedDeviceId).toBe("fan-primary"));
 
-    act(() => {
-      result.current.setFormPercent(55);
-    });
+    await waitFor(() => expect(result.current.fanState?.active_mode).toBe("curve"));
 
-    await act(async () => {
-      await result.current.refresh();
-    });
-
-    expect(result.current.formPercent).toBe(55);
-    expect(result.current.fanState?.slots[0]?.percent).toBe(75);
-    expect(result.current.stateRefreshing).toBe(false);
+    expect(result.current.selectedDeviceId).toBe("fan-primary");
+    expect(result.current.curveDraft.name).toBe("Balanced curve");
+    expect(result.current.selectedCurveName).toBe("Balanced curve");
+    expect(result.current.curves).toHaveLength(1);
+    await waitFor(() => expect(result.current.temperaturePreview?.display_name).toBe("CPU temperature"));
   });
 
-  it("applies manual fan changes and updates state from the backend response", async () => {
-    listDevicesMock.mockResolvedValue([device({ id: "fan-primary", name: "Fan Primary" })]);
-    getFanStateMock.mockResolvedValue(
-      fanState("fan-primary", [
-        { slot: 1, mode: "manual", percent: 40, pwm: 102, curve: null },
-        { slot: 2, mode: "manual", percent: 40, pwm: 102, curve: null },
-      ]),
-    );
-    setManualFanSpeedMock.mockResolvedValue(
-      fanState("fan-primary", [
-        { slot: 1, mode: "manual", percent: 65, pwm: 166, curve: null },
-        { slot: 2, mode: "manual", percent: 65, pwm: 166, curve: null },
-      ]),
-    );
+  it("surfaces safety and validation notices for unsupported or invalid drafts", async () => {
+    listDevicesMock.mockResolvedValue([fanDevice("fan-primary", "Fan Primary")]);
+    listFanCurvesMock.mockResolvedValue([fanCurve("Balanced curve")]);
+    getFanStateMock.mockResolvedValue(fanState("fan-primary"));
 
     const { result } = renderHook(() => useFansWorkbenchData("fan-primary"));
-    await waitFor(() => expect(result.current.selectedDeviceId).toBe("fan-primary"));
+    await waitFor(() => expect(result.current.fanState?.device_id).toBe("fan-primary"));
 
     act(() => {
-      result.current.setFormPercent(65);
+      result.current.setControlDraft((current) => ({
+        ...current,
+        mode: "start_stop",
+        manualPercent: 90,
+      }));
+      result.current.newCurve();
+      result.current.setCurveDraft((current) => ({
+        ...current,
+        temperature_source: "",
+        points: [{ temperature_celsius: 40, percent: 55 }],
+      }));
     });
 
-    await act(async () => {
-      await result.current.applyChanges();
-    });
-
-    expect(setManualFanSpeedMock).toHaveBeenCalledWith("fan-primary", {
-      percent: 65,
-    });
-    expect(result.current.success).toBe("Manual fan speed applied");
-    expect(result.current.formPercent).toBe(65);
-    expect(result.current.fanState?.slots[0]?.percent).toBe(65);
-  });
-
-  it("preserves last known rpm telemetry when the manual update response omits it", async () => {
-    listDevicesMock.mockResolvedValue([device({ id: "fan-primary", name: "Fan Primary" })]);
-    getFanStateMock.mockResolvedValue(
-      fanState("fan-primary", [
-        { slot: 1, mode: "manual", percent: 40, pwm: 102, curve: null },
-        { slot: 2, mode: "manual", percent: 40, pwm: 102, curve: null },
-      ]),
-    );
-    setManualFanSpeedMock.mockResolvedValue({
-      device_id: "fan-primary",
-      update_interval_ms: 1000,
-      rpms: null,
-      slots: [
-        { slot: 1, mode: "manual", percent: 31, pwm: 79, curve: null },
-        { slot: 2, mode: "manual", percent: 31, pwm: 79, curve: null },
-      ],
-    });
-
-    const { result } = renderHook(() => useFansWorkbenchData("fan-primary"));
-    await waitFor(() => expect(result.current.selectedDeviceId).toBe("fan-primary"));
-
-    act(() => {
-      result.current.setFormPercent(31);
-    });
-
-    await act(async () => {
-      await result.current.applyChanges();
-    });
-
-    expect(result.current.fanState?.rpms).toEqual([1000, 1010, 1020, 1030]);
-    expect(result.current.fanState?.slots[0]?.percent).toBe(31);
-    expect(result.current.formPercent).toBe(31);
-  });
-
-  it("surfaces fan-state loading errors", async () => {
-    listDevicesMock.mockResolvedValue([device({ id: "fan-primary", name: "Fan Primary" })]);
-    getFanStateMock.mockRejectedValue(new Error("fan backend unavailable"));
-
-    const { result } = renderHook(() => useFansWorkbenchData("fan-primary"));
-
-    await waitFor(() => expect(result.current.loading).toBe(false));
-
-    expect(result.current.error).toBe("fan backend unavailable");
-    expect(result.current.fanState).toBeNull();
-  });
-
-  it("reacts to fan events with a readonly refresh for the selected device", async () => {
-    listDevicesMock.mockResolvedValue([device({ id: "fan-primary", name: "Fan Primary" })]);
-    getFanStateMock
-      .mockResolvedValueOnce(
-        fanState("fan-primary", [
-          { slot: 1, mode: "manual", percent: 40, pwm: 102, curve: null },
-          { slot: 2, mode: "manual", percent: 40, pwm: 102, curve: null },
-        ]),
-      )
-      .mockResolvedValueOnce(
-        fanState("fan-primary", [
-          { slot: 1, mode: "manual", percent: 75, pwm: 191, curve: null },
-          { slot: 2, mode: "manual", percent: 75, pwm: 191, curve: null },
-        ]),
-      );
-
-    const { result } = renderHook(() => useFansWorkbenchData("fan-primary"));
-    await waitFor(() => expect(result.current.selectedDeviceId).toBe("fan-primary"));
-
-    act(() => {
-      result.current.setFormPercent(55);
-    });
-
-    act(() => {
-      emitBackendEvent({
-        type: "fan.changed",
-        device_id: "fan-primary",
-      });
-    });
-
-    await waitFor(() => expect(result.current.fanState?.slots[0]?.percent).toBe(75));
-
-    expect(result.current.formPercent).toBe(55);
+    const noticeTitles = result.current.notices.map((notice) => notice.title);
+    expect(noticeTitles).toContain("Start / stop is not available yet");
+    expect(noticeTitles).toContain("Curve validation");
+    expect(result.current.notices.some((notice) => notice.message.includes("at least two curve points"))).toBe(true);
+    expect(result.current.notices.some((notice) => notice.message.includes("Temperature source is required"))).toBe(true);
   });
 });
+
+
+

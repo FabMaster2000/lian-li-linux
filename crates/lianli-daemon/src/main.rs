@@ -3,6 +3,8 @@ mod ipc_server;
 mod openrgb_server;
 mod rgb_controller;
 mod service;
+mod temperature_sources;
+mod wireless_inventory;
 
 use clap::Parser;
 use std::path::PathBuf;

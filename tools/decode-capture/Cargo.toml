@@ -1,0 +1,15 @@
+[package]
+name = "decode-capture"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "decode-capture"
+path = "src/main.rs"
+
+[dependencies]
+lianli-devices = { path = "../../crates/lianli-devices" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }

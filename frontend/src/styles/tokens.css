@@ -1,0 +1,56 @@
+:root {
+  --font-display: "Avenir Next", "Trebuchet MS", "Segoe UI", sans-serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+
+  --text-xs: 0.76rem;
+  --text-sm: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.35rem;
+  --text-2xl: clamp(2rem, 4vw, 3.4rem);
+
+  --radius-sm: 0.875rem;
+  --radius-md: 1rem;
+  --radius-lg: 1.35rem;
+  --radius-xl: 1.8rem;
+  --radius-pill: 999px;
+
+  --color-bg-canvas: #071019;
+  --color-bg-surface: rgba(8, 20, 29, 0.88);
+  --color-bg-surface-strong: rgba(10, 24, 34, 0.96);
+  --color-bg-surface-soft: rgba(255, 255, 255, 0.04);
+  --color-bg-elevated: rgba(14, 31, 43, 0.78);
+  --color-line-soft: rgba(171, 207, 236, 0.14);
+  --color-line-strong: rgba(171, 207, 236, 0.28);
+  --color-text: #f6f7fb;
+  --color-text-muted: #9eb3c8;
+  --color-text-soft: #c8d7e4;
+  --color-accent-warm: #ff8c48;
+  --color-accent-teal: #4bd6c5;
+  --color-accent-ice: #8eb7ff;
+  --color-success: #49d1ae;
+  --color-warning: #ffce7a;
+  --color-danger: #ff8f8f;
+  --color-info: #7fd0ff;
+
+  --shadow-panel: 0 24px 60px rgba(0, 0, 0, 0.28);
+  --shadow-focus: 0 0 0 3px rgba(142, 183, 255, 0.28);
+
+  --surface-glow:
+    radial-gradient(circle at top left, rgba(255, 140, 72, 0.24), transparent 28%),
+    radial-gradient(circle at top right, rgba(75, 214, 197, 0.18), transparent 26%),
+    linear-gradient(180deg, #0a121a 0%, #071019 48%, #04080e 100%);
+
+  --bp-lg: 72rem;
+  --bp-md: 58rem;
+  --bp-sm: 40rem;
+}

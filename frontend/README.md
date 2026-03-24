@@ -149,6 +149,7 @@ rg --files src -g "*.test.ts" -g "*.test.tsx"
   - `src/hooks/useProfilesWorkbenchData.test.tsx`
   - `src/hooks/useLightingWorkbenchData.test.tsx`
   - `src/hooks/useFansWorkbenchData.test.tsx`
+  - `src/hooks/useWirelessSyncData.test.tsx`
   - `src/pages/SettingsPage.test.tsx`
   - `src/pages/DashboardPage.test.tsx`
   - `src/pages/DevicesPage.test.tsx`
@@ -156,6 +157,7 @@ rg --files src -g "*.test.ts" -g "*.test.tsx"
   - `src/pages/LightingPage.test.tsx`
   - `src/pages/FansPage.test.tsx`
   - `src/pages/ProfilesPage.test.tsx`
+  - `src/pages/WirelessSyncPage.test.tsx`
   - `src/services/api.test.ts`
   - `src/services/system.test.ts`
   - `src/state/server/useServerResource.test.tsx`
@@ -180,6 +182,7 @@ rg --files src -g "*.test.ts" -g "*.test.tsx"
   - lighting device loading, zone switching, apply success, apply failure, readonly refresh behavior, websocket-driven readonly refresh, offline-device handling, and compact live-state rendering
   - fan device loading, manual apply success, apply failure, mixed slot state rendering, readonly refresh behavior, websocket-driven readonly refresh, offline-device handling, and preserved RPM telemetry after apply
   - profile listing, create/delete/apply flows, and explicit-device validation on `/profiles`
+  - wireless topology loading, group filtering, live route rendering, and shared wireless-label persistence on `/wireless-sync`
   - device detail offline-state rendering
   - hook-level state management for lighting, fan, and profile workbenches, including background refresh behavior that does not overwrite editable drafts and non-optimistic profile mutations
 - The lighting-specific tests verify:

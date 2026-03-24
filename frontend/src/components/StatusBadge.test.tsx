@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { StatusBadge } from "./StatusBadge";
+import { StatusBadge } from "./ui/StatusBadge";
 
 describe("StatusBadge", () => {
   it("renders its label with the requested tone", () => {

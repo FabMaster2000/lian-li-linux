@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { EffectSelect } from "./EffectSelect";
+import { EffectSelect } from "./forms/EffectSelect";
 
 describe("EffectSelect", () => {
   it("renders effect options and forwards selection changes", async () => {

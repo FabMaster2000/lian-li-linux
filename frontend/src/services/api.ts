@@ -157,6 +157,10 @@ async function request<TResponse, TBody = undefined>(
     headers,
   };
 
+  if (method === "GET" && init.cache === undefined) {
+    init.cache = "no-store";
+  }
+
   if (body !== undefined) {
     headers.set("content-type", "application/json");
     init.body = JSON.stringify(body);

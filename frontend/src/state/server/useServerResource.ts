@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 type RefreshOptions = {
   background?: boolean;
@@ -24,6 +24,12 @@ export function useServerResource<TData>({
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const loadRef = useRef(load);
+  const loadErrorMessageRef = useRef(loadErrorMessage);
+  const inFlightRef = useRef<Promise<TData | null> | null>(null);
+
+  loadRef.current = load;
+  loadErrorMessageRef.current = loadErrorMessage;
 
   const refresh = useCallback(
     async (options: RefreshOptions = {}) => {
@@ -37,14 +43,30 @@ export function useServerResource<TData>({
 
       setError(null);
 
+      let request = inFlightRef.current;
+
+      if (!request) {
+        request = loadRef.current()
+          .then((nextData) => {
+            setData(nextData);
+            setLastUpdated(new Date().toISOString());
+            return nextData;
+          })
+          .catch((nextError) => {
+            setError(toErrorMessage(nextError, loadErrorMessageRef.current));
+            return null;
+          })
+          .finally(() => {
+            if (inFlightRef.current === request) {
+              inFlightRef.current = null;
+            }
+          });
+
+        inFlightRef.current = request;
+      }
+
       try {
-        const nextData = await load();
-        setData(nextData);
-        setLastUpdated(new Date().toISOString());
-        return nextData;
-      } catch (error) {
-        setError(toErrorMessage(error, loadErrorMessage));
-        return null;
+        return await request;
       } finally {
         if (background) {
           setRefreshing(false);
@@ -53,7 +75,7 @@ export function useServerResource<TData>({
         }
       }
     },
-    [load, loadErrorMessage],
+    [],
   );
 
   return {

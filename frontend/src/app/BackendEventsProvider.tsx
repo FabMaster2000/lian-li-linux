@@ -31,7 +31,8 @@ const BackendEventsContext = createContext<BackendEventsContextValue>({
   subscribe: () => noopUnsubscribe,
 });
 
-const reconnectDelayMs = 1000;
+const initialReconnectDelayMs = 1000;
+const maxReconnectDelayMs = 15_000;
 
 export function BackendEventsProvider({ children }: PropsWithChildren) {
   const [connectionState, setConnectionState] =
@@ -39,6 +40,7 @@ export function BackendEventsProvider({ children }: PropsWithChildren) {
   const listenersRef = useRef(new Set<BackendEventListener>());
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
   const disposedRef = useRef(false);
 
   const clearReconnectTimer = useCallback(() => {
@@ -69,6 +71,7 @@ export function BackendEventsProvider({ children }: PropsWithChildren) {
 
     socketRef.current = connectBackendEvents({
       onOpen: () => {
+        reconnectAttemptRef.current = 0;
         setConnectionState("connected");
       },
       onClose: () => {
@@ -80,10 +83,15 @@ export function BackendEventsProvider({ children }: PropsWithChildren) {
         }
 
         setConnectionState("reconnecting");
+        const delayMs = Math.min(
+          initialReconnectDelayMs * 2 ** reconnectAttemptRef.current,
+          maxReconnectDelayMs,
+        );
+        reconnectAttemptRef.current += 1;
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
           connect();
-        }, reconnectDelayMs);
+        }, delayMs);
       },
       onMessage: (event) => {
         for (const listener of listenersRef.current) {
@@ -98,6 +106,7 @@ export function BackendEventsProvider({ children }: PropsWithChildren) {
 
     return () => {
       disposedRef.current = true;
+      reconnectAttemptRef.current = 0;
       clearReconnectTimer();
       socketRef.current?.close();
       socketRef.current = null;

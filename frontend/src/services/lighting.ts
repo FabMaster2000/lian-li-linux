@@ -1,8 +1,12 @@
 import { apiClient } from "./api";
 import type {
+  LightingApplyRequest,
+  LightingApplyResponse,
   LightingBrightnessRequest,
   LightingColorRequest,
   LightingEffectRequest,
+  LightingEffectRouteResponse,
+  LightingEffectRouteSaveRequest,
   LightingStateResponse,
 } from "../types/api";
 
@@ -40,6 +44,24 @@ export function setLightingBrightness(
 ) {
   return apiClient.post<LightingStateResponse, LightingBrightnessRequest>(
     `${lightingBasePath(deviceId)}/brightness`,
+    request,
+  );
+}
+
+export function applyLightingWorkbench(request: LightingApplyRequest) {
+  return apiClient.post<LightingApplyResponse, LightingApplyRequest>(
+    "/lighting/apply",
+    request,
+  );
+}
+
+export function getLightingEffectRoute() {
+  return apiClient.get<LightingEffectRouteResponse>("/lighting/effect-route");
+}
+
+export function saveLightingEffectRoute(request: LightingEffectRouteSaveRequest) {
+  return apiClient.put<LightingEffectRouteResponse, LightingEffectRouteSaveRequest>(
+    "/lighting/effect-route",
     request,
   );
 }

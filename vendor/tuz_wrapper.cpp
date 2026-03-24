@@ -1,9 +1,10 @@
-// C wrapper around tinyuz compression for Rust FFI.
-// Provides a simple memory-to-memory compression API.
+// C wrapper around tinyuz compression/decompression for Rust FFI.
+// Provides simple memory-to-memory APIs.
 //
 // MIT License — wraps tinyuz (https://github.com/sisong/tinyuz)
 
 #include "tinyuz/compress/tuz_enc.h"
+#include "tinyuz/decompress/tuz_dec.h"
 #include <cstring>
 #include <cstdlib>
 
@@ -81,6 +82,18 @@ size_t tuz_compress_mem(const unsigned char* input, size_t input_len,
 /// Returns the maximum compressed output size for a given input length.
 size_t tuz_max_compressed_size(size_t input_len) {
     return (size_t)tuz_maxCompressedSize(input_len);
+}
+
+/// Decompress tinyuz-compressed data.
+///
+/// Returns the decompressed size on success, or 0 on failure.
+/// `output` must be large enough to hold the decompressed data.
+size_t tuz_decompress_mem_wrapper(const unsigned char* input, size_t input_len,
+                                  unsigned char* output, size_t output_capacity) {
+    tuz_size_t data_size = (tuz_size_t)output_capacity;
+    tuz_TResult result = tuz_decompress_mem(input, (tuz_size_t)input_len, output, &data_size);
+    if (result != tuz_STREAM_END) return 0;
+    return (size_t)data_size;
 }
 
 } // extern "C"

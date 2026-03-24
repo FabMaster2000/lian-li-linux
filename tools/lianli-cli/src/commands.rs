@@ -4,11 +4,21 @@ use clap::{Parser, Subcommand};
 use lianli_shared::config::AppConfig;
 use lianli_shared::fan::{FanConfig, FanGroup, FanSpeed};
 use lianli_shared::ipc::{DeviceInfo, IpcRequest, IpcResponse, TelemetrySnapshot};
-use lianli_shared::rgb::{RgbDirection, RgbEffect, RgbMode, RgbScope};
+use lianli_shared::rgb::{RgbDirection, RgbEffect, RgbMode, RgbScope, MAX_EFFECT_SPEED};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+const SLINF_ZONE_SEGMENTS: [(u16, u16); 5] = [
+    (0, 9),
+    (9, 9),
+    (18, 9),
+    (27, 9),
+    (36, 8),
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "lianli-cli", about = "Headless IPC client for lianli-daemon")]
@@ -59,7 +69,7 @@ pub enum Command {
         /// RGB zone index (default 0)
         #[arg(long, default_value_t = 0)]
         zone: u8,
-        /// Optional speed (0-4)
+        /// Optional speed (0-20)
         #[arg(long)]
         speed: Option<u8>,
         /// Optional brightness (0-4)
@@ -103,6 +113,22 @@ pub enum Command {
         /// Path to JSON config file
         file: PathBuf,
     },
+
+    /// Probe LEDs in Meteor traversal order (route x zones x LEDs)
+    ProbeMeteorOrder {
+        /// Duration each LED stays lit in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        step_ms: u64,
+        /// Probe color as hex, e.g. #ff00aa
+        #[arg(long)]
+        hex: Option<String>,
+        /// Probe color as RGB triplet, e.g. --rgb 255 0 170
+        #[arg(long, num_args = 3)]
+        rgb: Option<Vec<u8>>,
+        /// Print steps without sending probe commands
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -145,6 +171,12 @@ pub fn execute(cli: Cli) -> Result<()> {
         } => handle_set_fan(&client, device_id, percent, slot),
         Command::GetConfig => handle_get_config(&client),
         Command::SaveConfig { file } => handle_save_config(&client, file),
+        Command::ProbeMeteorOrder {
+            step_ms,
+            hex,
+            rgb,
+            dry_run,
+        } => handle_probe_meteor_order(&client, step_ms, hex, rgb, dry_run),
     }
 }
 
@@ -251,8 +283,8 @@ fn handle_set_effect(
     effect.mode = mode;
 
     if let Some(spd) = speed {
-        if spd > 4 {
-            bail!("speed must be between 0 and 4");
+        if spd > MAX_EFFECT_SPEED {
+            bail!("speed must be between 0 and {MAX_EFFECT_SPEED}");
         }
         effect.speed = spd;
     }
@@ -359,6 +391,145 @@ fn handle_save_config(client: &DaemonClient, file: PathBuf) -> Result<()> {
         }
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
     }
+}
+
+fn handle_probe_meteor_order(
+    client: &DaemonClient,
+    step_ms: u64,
+    hex: Option<String>,
+    rgb: Option<Vec<u8>>,
+    dry_run: bool,
+) -> Result<()> {
+    if step_ms == 0 {
+        bail!("step_ms must be greater than zero");
+    }
+
+    let color = if hex.is_some() || rgb.is_some() {
+        parse_color(hex, rgb)?
+    } else {
+        [255, 255, 255]
+    };
+
+    let devices: Vec<DeviceInfo> = unwrap_response(client.send(&IpcRequest::ListDevices)?)?;
+    let device_map = devices
+        .into_iter()
+        .map(|device| (device.device_id.clone(), device))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let config: AppConfig = unwrap_response(client.send(&IpcRequest::GetConfig)?)?;
+    let Some(rgb_cfg) = config.rgb else {
+        bail!("config has no rgb section");
+    };
+
+    if rgb_cfg.effect_route.is_empty() {
+        bail!("rgb.effect_route is empty");
+    }
+
+    let mut restore_effects = std::collections::HashMap::<(String, u8), RgbEffect>::new();
+    let mut steps = 0usize;
+    let sleep_duration = Duration::from_millis(step_ms);
+
+    for entry in rgb_cfg.effect_route {
+        let Some(device) = device_map.get(&entry.device_id) else {
+            eprintln!(
+                "skip route entry {} fan {}: device not present",
+                entry.device_id, entry.fan_index
+            );
+            continue;
+        };
+
+        if !entry.device_id.starts_with("wireless:") {
+            eprintln!(
+                "skip route entry {} fan {}: not a wireless device",
+                entry.device_id, entry.fan_index
+            );
+            continue;
+        }
+
+        let fan_count = device.fan_count.unwrap_or(0);
+        if fan_count == 0 || entry.fan_index == 0 || entry.fan_index > fan_count {
+            eprintln!(
+                "skip route entry {} fan {}: fan out of range (device fan_count={fan_count})",
+                entry.device_id, entry.fan_index
+            );
+            continue;
+        }
+
+        for (zone_offset, _) in SLINF_ZONE_SEGMENTS.iter().enumerate() {
+            let zone = zone_offset as u8;
+            restore_effects
+                .entry((entry.device_id.clone(), zone))
+                .or_insert_with(|| base_effect(client, &entry.device_id, zone).unwrap_or_default());
+        }
+
+        let max_zone_leds = SLINF_ZONE_SEGMENTS
+            .iter()
+            .map(|(_, zone_len)| *zone_len)
+            .max()
+            .unwrap_or(0);
+
+        for led_offset in 0..max_zone_leds {
+            for (zone_offset, (zone_start, zone_len)) in SLINF_ZONE_SEGMENTS.iter().enumerate() {
+                if led_offset >= *zone_len {
+                    continue;
+                }
+
+                let zone = zone_offset as u8;
+                let raw_led_index = zone_start + led_offset;
+                steps += 1;
+                println!(
+                    "step={steps} device={} fan={} zone={} zone_led={} raw_led={} color=#{:02x}{:02x}{:02x}",
+                    entry.device_id,
+                    entry.fan_index,
+                    zone + 1,
+                    led_offset,
+                    raw_led_index,
+                    color[0],
+                    color[1],
+                    color[2]
+                );
+
+                if !dry_run {
+                    let response = client.send(&IpcRequest::ProbeRgbLed {
+                        device_id: entry.device_id.clone(),
+                        fan_index: entry.fan_index,
+                        led_index: raw_led_index,
+                        color,
+                    })?;
+
+                    if let IpcResponse::Error { message } = response {
+                        eprintln!(
+                            "probe failed on device={} fan={} zone={} zone_led={} raw_led={}: {message}",
+                            entry.device_id,
+                            entry.fan_index,
+                            zone + 1,
+                            led_offset,
+                            raw_led_index
+                        );
+                    }
+
+                    thread::sleep(sleep_duration);
+                }
+            }
+        }
+    }
+
+    if !dry_run {
+        for ((device_id, zone), effect) in restore_effects {
+            let response = client.send(&IpcRequest::SetRgbEffect {
+                device_id,
+                zone,
+                effect,
+            })?;
+
+            if let IpcResponse::Error { message } = response {
+                eprintln!("restore failed: {message}");
+            }
+        }
+    }
+
+    println!("completed steps={steps} dry_run={dry_run}");
+    Ok(())
 }
 
 fn send_rgb_effect(client: &DaemonClient, device_id: String, zone: u8, effect: RgbEffect) -> Result<()> {
@@ -477,6 +648,7 @@ fn base_effect(client: &DaemonClient, device_id: &str, zone: u8) -> Result<RgbEf
         brightness: 4,
         direction: RgbDirection::Clockwise,
         scope: RgbScope::All,
+        smoothness_ms: 0,
     })
 }
 

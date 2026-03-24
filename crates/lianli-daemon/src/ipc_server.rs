@@ -4,6 +4,9 @@
 //! The GUI polls periodically for telemetry. Config writes go through IPC.
 
 use crate::rgb_controller::RgbController;
+use crate::temperature_sources;
+use crate::wireless_inventory::build_wireless_inventory;
+use lianli_devices::wireless::WirelessController;
 use lianli_shared::config::AppConfig;
 use lianli_shared::ipc::{DeviceInfo, IpcRequest, IpcResponse, TelemetrySnapshot};
 use parking_lot::Mutex;
@@ -31,6 +34,8 @@ pub struct DaemonState {
     pub config_reload_pending: bool,
     /// RGB controller, set once devices are opened.
     pub rgb_controller: Option<Arc<Mutex<RgbController>>>,
+    /// Wireless controller clone for management operations like disconnect.
+    pub wireless_controller: Option<WirelessController>,
 }
 
 impl DaemonState {
@@ -42,6 +47,7 @@ impl DaemonState {
             telemetry: TelemetrySnapshot::default(),
             config_reload_pending: false,
             rgb_controller: None,
+            wireless_controller: None,
         }
     }
 }
@@ -173,6 +179,104 @@ fn handle_request(request: IpcRequest, state: &Arc<Mutex<DaemonState>>) -> IpcRe
             IpcResponse::ok(&state.telemetry)
         }
 
+        IpcRequest::RefreshWirelessDiscovery => {
+            let wireless = {
+                let state = state.lock();
+                state.wireless_controller.clone()
+            };
+
+            let Some(wireless) = wireless else {
+                return IpcResponse::error("Wireless controller not initialized");
+            };
+
+            match wireless.refresh_discovery() {
+                Ok(device_count) => {
+                    let mut state = state.lock();
+                    sync_wireless_inventory(&mut state, &wireless);
+                    IpcResponse::ok(serde_json::json!({
+                        "refreshed": true,
+                        "device_count": device_count,
+                    }))
+                }
+                Err(err) => IpcResponse::error(format!("wireless discovery refresh failed: {err}")),
+            }
+        }
+
+        IpcRequest::BindWirelessDevice { device_id } => {
+            let wireless = {
+                let state = state.lock();
+                state.wireless_controller.clone()
+            };
+
+            let Some(wireless) = wireless else {
+                return IpcResponse::error("Wireless controller not initialized");
+            };
+
+            match wireless.bind_device(&device_id) {
+                Ok(()) => {
+                    let refresh_result = wireless.refresh_discovery();
+                    let mut state = state.lock();
+                    sync_wireless_inventory(&mut state, &wireless);
+                    match refresh_result {
+                        Ok(_) => IpcResponse::ok(serde_json::json!({
+                            "device_id": device_id,
+                            "connected": true,
+                        })),
+                        Err(err) => IpcResponse::error(format!(
+                            "wireless bind succeeded but discovery refresh failed: {err}"
+                        )),
+                    }
+                }
+                Err(err) => IpcResponse::error(format!("wireless bind failed: {err}")),
+            }
+        }
+
+        IpcRequest::UnbindWirelessDevice { device_id } => {
+            let wireless = {
+                let state = state.lock();
+                state.wireless_controller.clone()
+            };
+
+            let Some(wireless) = wireless else {
+                return IpcResponse::error("Wireless controller not initialized");
+            };
+
+            match wireless.unbind_device(&device_id) {
+                Ok(()) => {
+                    let refresh_result = wireless.refresh_discovery();
+                    let mut state = state.lock();
+                    sync_wireless_inventory(&mut state, &wireless);
+                    if let Err(err) = refresh_result {
+                        warn!("wireless unbind refresh failed after disconnecting {device_id}: {err}");
+                    }
+
+                    let still_connected = wireless
+                        .devices()
+                        .into_iter()
+                        .find(|device| format!("wireless:{}", device.mac_str()) == device_id)
+                        .map(|device| {
+                            let master_mac = wireless.master_mac();
+                            !device.master_mac.iter().all(|&byte| byte == 0)
+                                && device.master_mac == master_mac
+                        })
+                        .unwrap_or(false);
+
+                    if still_connected {
+                        warn!(
+                            "wireless unbind for {device_id} did not fully clear on RF; keeping the device locally detached from control"
+                        );
+                    }
+
+                    IpcResponse::ok(serde_json::json!({
+                        "device_id": device_id,
+                        "disconnected": true,
+                        "hardware_detached": !still_connected,
+                    }))
+                }
+                Err(err) => IpcResponse::error(format!("wireless unbind failed: {err}")),
+            }
+        }
+
         IpcRequest::SetConfig { config } => {
             let mut state = state.lock();
             match write_config(&state.config_path, &config) {
@@ -221,6 +325,10 @@ fn handle_request(request: IpcRequest, state: &Arc<Mutex<DaemonState>>) -> IpcRe
                 }
                 Err(e) => IpcResponse::error(format!("failed to write config: {e}")),
             }
+        }
+
+        IpcRequest::PreviewFanTemperature { source } => {
+            IpcResponse::ok(temperature_sources::preview_temperature_source(&source))
         }
 
         IpcRequest::SetFanSpeed {
@@ -273,6 +381,23 @@ fn handle_request(request: IpcRequest, state: &Arc<Mutex<DaemonState>>) -> IpcRe
             }
         }
 
+        IpcRequest::ProbeRgbLed {
+            device_id,
+            fan_index,
+            led_index,
+            color,
+        } => {
+            let state = state.lock();
+            if let Some(ref rgb) = state.rgb_controller {
+                match rgb.lock().probe_led(&device_id, fan_index, led_index, color) {
+                    Ok(()) => IpcResponse::ok(serde_json::json!(null)),
+                    Err(e) => IpcResponse::error(format!("RGB probe error: {e}")),
+                }
+            } else {
+                IpcResponse::error("RGB controller not initialized")
+            }
+        }
+
         IpcRequest::SetMbRgbSync { device_id, enabled } => {
             let state = state.lock();
             if let Some(ref rgb) = state.rgb_controller {
@@ -319,6 +444,26 @@ fn handle_request(request: IpcRequest, state: &Arc<Mutex<DaemonState>>) -> IpcRe
         IpcRequest::Subscribe => {
             IpcResponse::error("Subscribe not yet implemented; use polling via GetTelemetry")
         }
+    }
+}
+
+fn sync_wireless_inventory(state: &mut DaemonState, wireless: &WirelessController) {
+    state
+        .devices
+        .retain(|device| !device.device_id.starts_with("wireless:"));
+    state
+        .telemetry
+        .fan_rpms
+        .retain(|device_id, _| !device_id.starts_with("wireless:"));
+
+    let (wireless_devices, wireless_telemetry) = build_wireless_inventory(wireless);
+    state.devices.splice(0..0, wireless_devices);
+    for (device_id, rpms) in wireless_telemetry {
+        state.telemetry.fan_rpms.insert(device_id, rpms);
+    }
+
+    if let Some(ref rgb) = state.rgb_controller {
+        rgb.lock().refresh_wireless_devices();
     }
 }
 

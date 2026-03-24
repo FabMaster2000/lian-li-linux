@@ -74,13 +74,64 @@ export type DeviceState = {
   streaming_active: boolean | null;
 };
 
+export type DeviceControllerContext = {
+  id: string;
+  label: string;
+  kind: string;
+};
+
+export type DeviceWirelessContext = {
+  transport: string;
+  channel: number | null;
+  group_id: string | null;
+  group_label: string | null;
+  binding_state: "connected" | "available" | "foreign" | null;
+  master_mac: string | null;
+};
+
+export type DeviceHealthState = {
+  level: string;
+  summary: string;
+};
+
 export type DeviceView = {
   id: string;
   name: string;
+  display_name: string;
   family: string;
   online: boolean;
+  ui_order: number;
+  physical_role: string;
+  capability_summary: string;
+  current_mode_summary: string;
+  controller: DeviceControllerContext;
+  wireless: DeviceWirelessContext | null;
+  health: DeviceHealthState;
   capabilities: DeviceCapability;
   state: DeviceState;
+};
+
+export type DevicePresentationUpdateRequest = {
+  display_name: string;
+  ui_order: number;
+  physical_role?: string | null;
+  controller_label?: string | null;
+  cluster_label?: string | null;
+};
+
+export type WirelessDisconnectResponse = {
+  device_id: string;
+  disconnected: boolean;
+};
+
+export type WirelessConnectResponse = {
+  device_id: string;
+  connected: boolean;
+};
+
+export type WirelessDiscoveryRefreshResponse = {
+  refreshed: boolean;
+  device_count: number;
 };
 
 export type RgbColor = {
@@ -105,8 +156,27 @@ export type LightingEffectRequest = {
   speed?: number;
   brightness?: number;
   color?: ColorValue;
+  colors?: ColorValue[];
   direction?: string;
   scope?: string;
+  smoothness_ms?: number;
+};
+
+export type LightingApplyRequest = {
+  target_mode: "single" | "selected" | "all" | "route";
+  device_id?: string | null;
+  device_ids?: string[];
+  zone_mode: "active" | "all_zones";
+  zone?: number | null;
+  sync_selected?: boolean;
+  effect: string;
+  brightness: number;
+  speed?: number;
+  color?: ColorValue | null;
+  colors?: ColorValue[];
+  direction?: string | null;
+  scope?: string | null;
+  smoothness_ms?: number;
 };
 
 export type LightingBrightnessRequest = {
@@ -122,6 +192,7 @@ export type LightingZoneState = {
   brightness_percent: number;
   direction: string;
   scope: string;
+  smoothness_ms: number;
 };
 
 export type LightingStateResponse = {
@@ -129,9 +200,111 @@ export type LightingStateResponse = {
   zones: LightingZoneState[];
 };
 
+export type LightingLedZoneConfigDocument = {
+  zone: number;
+  led_indexes: number[];
+};
+
+export type LightingZoneLayoutResponse = {
+  device_id: string;
+  device_name: string;
+  fan_count: number;
+  leds_per_fan: number;
+  suggested_zone_count: number;
+  zones: LightingLedZoneConfigDocument[];
+};
+
+export type LightingZoneLayoutSaveRequest = {
+  fan_index: number;
+  zones: LightingLedZoneConfigDocument[];
+};
+
+export type LightingEffectRouteEntryDocument = {
+  device_id: string;
+  fan_index: number;
+};
+
+export type LightingEffectRouteResponse = {
+  route: LightingEffectRouteEntryDocument[];
+};
+
+export type LightingEffectRouteSaveRequest = {
+  route: LightingEffectRouteEntryDocument[];
+};
+
+export type LightingLedProbeRequest = {
+  fan_index: number;
+  led_index: number;
+  color: ColorValue;
+};
+
+export type LightingLedProbeResponse = {
+  device_id: string;
+  fan_index: number;
+  led_index: number;
+  applied: boolean;
+};
+
+export type LightingZoneLayoutRestoreResponse = {
+  device_id: string;
+  restored: boolean;
+};
+
+export type LightingApplyDeviceState = {
+  device_id: string;
+  zones: LightingZoneState[];
+};
+
+export type LightingApplySkip = {
+  device_id: string;
+  reason: string;
+};
+
+export type LightingApplyResponse = {
+  target_mode: string;
+  zone_mode: string;
+  requested_device_ids: string[];
+  applied_devices: LightingApplyDeviceState[];
+  skipped_devices: LightingApplySkip[];
+  sync_selected: boolean;
+};
+
 export type FanManualRequest = {
   percent: number;
   slot?: number;
+};
+
+export type FanCurveUpsertRequest = {
+  name: string;
+  temperature_source: string;
+  points: FanCurvePointDocument[];
+};
+
+export type FanTemperatureComponent = {
+  key: string;
+  label: string;
+  kind: string;
+  available: boolean;
+  celsius: number | null;
+  note?: string | null;
+};
+
+export type FanTemperaturePreview = {
+  source: string;
+  display_name: string;
+  available: boolean;
+  celsius: number | null;
+  components: FanTemperatureComponent[];
+  note?: string | null;
+};
+
+export type FanApplyRequest = {
+  target_mode: "single" | "selected" | "all";
+  device_id?: string | null;
+  device_ids?: string[];
+  mode: "manual" | "curve" | "mb_sync" | "start_stop";
+  percent?: number | null;
+  curve?: string | null;
 };
 
 export type FanSlotState = {
@@ -147,18 +320,46 @@ export type FanStateResponse = {
   update_interval_ms: number;
   rpms: number[] | null;
   slots: FanSlotState[];
+  active_mode?: string;
+  active_curve?: string | null;
+  temperature_source?: string | null;
+  mb_sync_enabled?: boolean;
+  start_stop_supported?: boolean;
+  start_stop_enabled?: boolean;
+};
+
+export type FanApplySkip = {
+  device_id: string;
+  reason: string;
+};
+
+export type FanApplyResponse = {
+  target_mode: string;
+  mode: string;
+  requested_device_ids: string[];
+  applied_devices: FanStateResponse[];
+  skipped_devices: FanApplySkip[];
 };
 
 export type LightingConfigDocument = {
   enabled: boolean;
   openrgb_server: boolean;
   openrgb_port: number;
+  global_led_zones: LightingLedZoneConfigDocument[];
+  fan_led_zones: LightingFanLedZoneConfigDocument[];
   devices: LightingDeviceConfigDocument[];
+};
+
+export type LightingFanLedZoneConfigDocument = {
+  device_id: string;
+  fan_index: number;
+  zones: LightingLedZoneConfigDocument[];
 };
 
 export type LightingDeviceConfigDocument = {
   device_id: string;
   motherboard_sync: boolean;
+  led_zones: LightingLedZoneConfigDocument[];
   zones: LightingZoneConfigDocument[];
 };
 
@@ -172,6 +373,7 @@ export type LightingZoneConfigDocument = {
   scope: string;
   swap_left_right: boolean;
   swap_top_bottom: boolean;
+  smoothness_ms: number;
 };
 
 export type FanCurvePointDocument = {
@@ -340,3 +542,6 @@ export type BackendEventEnvelope<TData extends JsonValue = JsonValue> = {
   device_id: string | null;
   data: TData;
 };
+
+
+

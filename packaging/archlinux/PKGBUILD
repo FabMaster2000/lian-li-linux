@@ -2,7 +2,7 @@
 pkgname=lianli-linux-git
 pkgver=r36.5d9c01c
 pkgrel=1
-pkgdesc="Open-source Linux replacement for L-Connect 3 — fan control, RGB, LCD streaming for Lian Li devices"
+pkgdesc="Open-source Linux web controller for Lian Li devices"
 arch=('x86_64')
 url="https://github.com/sgtaziz/lian-li-linux"
 license=('MIT')
@@ -37,12 +37,12 @@ package() {
 
   # Binaries
   install -Dm755 target/release/lianli-daemon "$pkgdir/usr/bin/lianli-daemon"
-  install -Dm755 target/release/lianli-gui "$pkgdir/usr/bin/lianli-gui"
+  install -Dm755 target/release/lianli-backend "$pkgdir/usr/bin/lianli-backend"
 
   # udev rules
   install -Dm644 udev/99-lianli.rules "$pkgdir/usr/lib/udev/rules.d/99-lianli.rules"
 
-  # Systemd user service
+  # Systemd user services
   install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/lianli-daemon.service" <<EOF
 [Unit]
 Description=Lian Li Device Daemon
@@ -58,18 +58,36 @@ RestartSec=5
 WantedBy=default.target
 EOF
 
-  # Desktop entry
-  install -Dm644 lianli-gui.desktop "$pkgdir/usr/share/applications/lianli-gui.desktop"
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/lianli-backend.service" <<EOF
+[Unit]
+Description=Lian Li Web Backend
+After=lianli-daemon.service
+Requires=lianli-daemon.service
 
-  # Icons
-  install -Dm644 assets/icons/32x32.png "$pkgdir/usr/share/icons/hicolor/32x32/apps/lianli-gui.png"
-  install -Dm644 assets/icons/128x128.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/lianli-gui.png"
-  install -Dm644 assets/icons/128x128@2x.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/lianli-gui.png"
-  install -Dm644 assets/icons/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/lianli-gui.svg"
+[Service]
+Type=simple
+ExecStart=/usr/bin/lianli-backend
+Restart=on-failure
+RestartSec=5
+Environment=LIANLI_BACKEND_CONFIG=%h/.config/lianli/backend.json
 
-  # Auto-enable daemon for all users
+[Install]
+WantedBy=default.target
+EOF
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/lianli-stack.target" <<EOF
+[Unit]
+Description=Lian Li Daemon and Backend Stack
+Wants=lianli-daemon.service lianli-backend.service
+After=lianli-daemon.service lianli-backend.service
+
+[Install]
+WantedBy=default.target
+EOF
+
+  # Auto-enable the daemon and backend stack for all users
   install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user-preset/50-lianli.preset" <<EOF
-enable lianli-daemon.service
+enable lianli-stack.target
 EOF
 
   # License

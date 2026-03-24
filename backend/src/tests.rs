@@ -5,7 +5,8 @@ use crate::events::{EventHub, WebEvent};
 use crate::models::{
     ConfigDocument, FanConfigDocument, FanDeviceConfigDocument, FanSlotConfigDocument,
     LcdConfigDocument, LightingConfigDocument, LightingDeviceConfigDocument,
-    LightingZoneConfigDocument, ProfileApplyResponse, ProfileDocument, ProfileFanDocument,
+    LightingLedZoneConfigDocument, LightingZoneConfigDocument, ProfileApplyResponse,
+    ProfileDocument, ProfileFanDocument,
     ProfileLightingDocument, ProfileTargetsDocument, ProfileUpsertDocument,
     SensorConfigDocument, SensorRangeDocument, SensorSourceDocument,
 };
@@ -23,10 +24,13 @@ use serde_json::json;
 use lianli_shared::device_id::DeviceFamily;
 use lianli_shared::config::{AppConfig as DaemonConfig, HidDriver, LcdConfig};
 use lianli_shared::fan::{FanConfig, FanGroup, FanSpeed};
-use lianli_shared::ipc::{DeviceInfo, IpcRequest, IpcResponse, TelemetrySnapshot};
+use lianli_shared::ipc::{
+    DeviceInfo, IpcRequest, IpcResponse, TelemetrySnapshot, WirelessBindingState,
+};
 use lianli_shared::media::MediaType;
 use lianli_shared::rgb::{
-    RgbAppConfig, RgbDeviceConfig, RgbDirection, RgbEffect, RgbMode, RgbScope, RgbZoneConfig,
+    RgbAppConfig, RgbDeviceCapabilities, RgbDeviceConfig, RgbDirection, RgbEffect,
+    RgbFanLedZoneConfig, RgbLedZoneConfig, RgbMode, RgbScope, RgbZoneConfig,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr};
@@ -178,6 +182,12 @@ fn sample_daemon_config() -> DaemonConfig {
             enabled: true,
             openrgb_server: false,
             openrgb_port: 6743,
+            global_led_zones: vec![RgbLedZoneConfig {
+                zone_index: 0,
+                led_indexes: vec![0, 1, 2],
+            }],
+            fan_led_zones: Vec::new(),
+            effect_route: Vec::new(),
             devices: vec![RgbDeviceConfig {
                 device_id: "wireless:test".to_string(),
                 mb_rgb_sync: false,
@@ -190,9 +200,14 @@ fn sample_daemon_config() -> DaemonConfig {
                         brightness: 3,
                         direction: RgbDirection::Clockwise,
                         scope: RgbScope::All,
+                        smoothness_ms: 0,
                     },
                     swap_lr: false,
                     swap_tb: false,
+                }],
+                led_zones: vec![RgbLedZoneConfig {
+                    zone_index: 0,
+                    led_indexes: vec![0, 1, 2],
                 }],
             }],
         }),
@@ -207,6 +222,12 @@ fn sample_config_document() -> ConfigDocument {
             enabled: true,
             openrgb_server: false,
             openrgb_port: 6743,
+            global_led_zones: vec![LightingLedZoneConfigDocument {
+                zone: 0,
+                led_indexes: vec![0, 1, 2],
+            }],
+            fan_led_zones: Vec::new(),
+            effect_route: Vec::new(),
             devices: vec![LightingDeviceConfigDocument {
                 device_id: "wireless:test".to_string(),
                 motherboard_sync: false,
@@ -220,6 +241,11 @@ fn sample_config_document() -> ConfigDocument {
                     scope: "All".to_string(),
                     swap_left_right: false,
                     swap_top_bottom: false,
+                    smoothness_ms: 0,
+                }],
+                led_zones: vec![LightingLedZoneConfigDocument {
+                    zone: 0,
+                    led_indexes: vec![0, 1, 2],
                 }],
             }],
         },
@@ -302,6 +328,8 @@ fn device_info(device_id: &str, name: &str, has_rgb: bool, has_fan: bool) -> Dev
         family: DeviceFamily::SlInf,
         name: name.to_string(),
         serial: None,
+        wireless_channel: None,
+        wireless_missed_polls: None,
         has_lcd: false,
         has_fan,
         has_pump: false,
@@ -312,6 +340,8 @@ fn device_info(device_id: &str, name: &str, has_rgb: bool, has_fan: bool) -> Dev
         rgb_zone_count: Some(1),
         screen_width: None,
         screen_height: None,
+        wireless_master_mac: None,
+        wireless_binding_state: None,
     }
 }
 
@@ -434,9 +464,14 @@ fn sample_device_config(device_id: &str) -> DaemonConfig {
                     brightness: 3,
                     direction: RgbDirection::Clockwise,
                     scope: RgbScope::All,
+                    smoothness_ms: 0,
                 },
                 swap_lr: false,
                 swap_tb: false,
+            }],
+            led_zones: vec![RgbLedZoneConfig {
+                zone_index: 0,
+                led_indexes: vec![0, 1, 2],
             }],
         }];
     }
@@ -925,7 +960,9 @@ async fn runtime_endpoint_returns_backend_and_daemon_paths() {
 #[tokio::test]
 async fn devices_endpoint_returns_device_list_with_telemetry() {
     let device_id = "wireless:test:device";
-    let devices = vec![device_info(device_id, "Sim Device", true, true)];
+    let mut device = device_info(device_id, "Sim Device", true, true);
+    device.wireless_channel = Some(8);
+    let devices = vec![device];
     let telemetry = sample_telemetry(device_id);
     let mock = MockDaemon::new(2, move |request| match request {
         IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
@@ -944,6 +981,13 @@ async fn devices_endpoint_returns_device_list_with_telemetry() {
     let items = body.as_array().expect("device array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], device_id);
+    assert_eq!(items[0]["display_name"], "Sim Device 4-fan cluster [test:device]");
+    assert_eq!(items[0]["physical_role"], "4-fan cluster");
+    assert_eq!(items[0]["ui_order"], 0);
+    assert_eq!(items[0]["controller"]["id"], "wireless:mesh");
+    assert_eq!(items[0]["controller"]["label"], "Wireless dongle");
+    assert_eq!(items[0]["wireless"]["channel"], json!(8));
+    assert_eq!(items[0]["health"]["level"], "healthy");
     assert_eq!(items[0]["state"]["fan_rpms"], json!([910, 920, 930, 940]));
     assert_eq!(items[0]["state"]["coolant_temp"], json!(31.5));
     assert_eq!(items[0]["state"]["streaming_active"], json!(true));
@@ -954,6 +998,37 @@ async fn devices_endpoint_returns_device_list_with_telemetry() {
     assert!(matches!(requests[1], IpcRequest::GetTelemetry));
 }
 
+#[tokio::test]
+async fn devices_endpoint_marks_stale_wireless_devices_offline() {
+    let device_id = "wireless:test:device";
+    let mut device = device_info(device_id, "Sim Device", true, true);
+    device.wireless_channel = Some(8);
+    device.wireless_missed_polls = Some(1);
+    let devices = vec![device];
+    let telemetry = sample_telemetry(device_id);
+    let mock = MockDaemon::new(2, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetTelemetry => IpcResponse::ok(telemetry.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, "/api/devices"))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    let items = body.as_array().expect("device array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], device_id);
+    assert_eq!(items[0]["online"], json!(false));
+    assert_eq!(items[0]["health"]["level"], "offline");
+    assert_eq!(items[0]["health"]["summary"], "Wireless device not seen in the latest discovery poll");
+    assert_eq!(items[0]["current_mode_summary"], "Wireless device offline");
+    assert_eq!(items[0]["state"]["fan_rpms"], serde_json::Value::Null);
+}
 #[tokio::test]
 async fn devices_endpoint_returns_bad_gateway_when_daemon_transport_fails() {
     let mock = MockDaemon::new(0, |_| panic!("daemon should not be called"));
@@ -1055,6 +1130,63 @@ async fn get_device_supports_url_encoded_ids_with_colons() {
     assert!(matches!(requests[1], IpcRequest::GetTelemetry));
 }
 
+#[tokio::test]
+async fn update_device_presentation_persists_labels_and_ordering() {
+    let device_id = "wireless:test:device";
+    let path = format!("/api/devices/{}/presentation", encoded_device_id(device_id));
+    let mut device = device_info(device_id, "Sim Device", true, true);
+    device.wireless_channel = Some(8);
+    let devices = vec![device];
+    let telemetry = sample_telemetry(device_id);
+    let mock = MockDaemon::new(5, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetTelemetry => IpcResponse::ok(telemetry.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let app = mock.app();
+
+    let update_response = app
+        .clone()
+        .oneshot(json_request(
+            Method::PUT,
+            &path,
+            serde_json::json!({
+                "display_name": "Desk Cluster",
+                "ui_order": 25,
+                "physical_role": "Rear intake cluster",
+                "controller_label": "Desk wireless",
+                "cluster_label": "Desk Cluster",
+            }),
+        ))
+        .await
+        .expect("send update request");
+
+    assert_eq!(update_response.status(), StatusCode::OK);
+    let updated_body: serde_json::Value = read_json(update_response).await;
+    assert_eq!(updated_body["display_name"], "Desk Cluster");
+    assert_eq!(updated_body["ui_order"], 25);
+    assert_eq!(updated_body["physical_role"], "Rear intake cluster");
+    assert_eq!(updated_body["controller"]["label"], "Desk wireless");
+    assert_eq!(updated_body["wireless"]["group_label"], "Desk Cluster");
+
+    let list_response = app
+        .oneshot(empty_request(Method::GET, "/api/devices"))
+        .await
+        .expect("send list request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed_body: serde_json::Value = read_json(list_response).await;
+    assert_eq!(listed_body[0]["display_name"], "Desk Cluster");
+    assert_eq!(listed_body[0]["ui_order"], 25);
+    assert_eq!(listed_body[0]["controller"]["label"], "Desk wireless");
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 5);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+    assert!(matches!(requests[1], IpcRequest::ListDevices));
+    assert!(matches!(requests[2], IpcRequest::GetTelemetry));
+    assert!(matches!(requests[3], IpcRequest::ListDevices));
+    assert!(matches!(requests[4], IpcRequest::GetTelemetry));
+}
 #[tokio::test]
 async fn lighting_state_returns_existing_zone_config() {
     let device_id = "wireless:test:lighting";
@@ -1310,6 +1442,417 @@ async fn lighting_brightness_endpoint_rejects_percent_over_100() {
 }
 
 #[tokio::test]
+async fn lighting_zone_layout_get_preserves_led_order() {
+    let device_id = "wireless:test:zones";
+    let path = format!(
+        "/api/devices/{}/lighting/zone-layout",
+        encoded_device_id(device_id)
+    );
+    let mut config = sample_device_config(device_id);
+    config.rgb = Some(RgbAppConfig {
+        enabled: true,
+        openrgb_server: false,
+        openrgb_port: 6743,
+        global_led_zones: vec![
+            RgbLedZoneConfig {
+                zone_index: 0,
+                led_indexes: vec![7, 3, 5, 1],
+            },
+            RgbLedZoneConfig {
+                zone_index: 1,
+                led_indexes: vec![12, 9, 10],
+            },
+        ],
+        fan_led_zones: Vec::new(),
+        effect_route: Vec::new(),
+        devices: Vec::new(),
+    });
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.fan_count = Some(3);
+    let capabilities = vec![rgb_capabilities(device_id, 3, 44)];
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetRgbCapabilities => IpcResponse::ok(capabilities.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["zones"][0]["led_indexes"], json!([7, 3, 5, 1]));
+    assert_eq!(body["zones"][1]["led_indexes"], json!([12, 9, 10]));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 3);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+    assert!(matches!(requests[1], IpcRequest::GetRgbCapabilities));
+    assert!(matches!(requests[2], IpcRequest::GetConfig));
+}
+
+#[tokio::test]
+async fn lighting_zone_layout_get_reads_requested_fan_slot_first() {
+    let device_id = "wireless:test:zones";
+    let path = format!(
+        "/api/devices/{}/lighting/zone-layout?fan_index=2",
+        encoded_device_id(device_id)
+    );
+    let mut config = sample_device_config(device_id);
+    config.rgb = Some(RgbAppConfig {
+        enabled: true,
+        openrgb_server: false,
+        openrgb_port: 6743,
+        global_led_zones: vec![RgbLedZoneConfig {
+            zone_index: 0,
+            led_indexes: vec![0, 1, 2],
+        }],
+        fan_led_zones: vec![RgbFanLedZoneConfig {
+            device_id: device_id.to_string(),
+            fan_index: 2,
+            zones: vec![
+                RgbLedZoneConfig {
+                    zone_index: 0,
+                    led_indexes: vec![7, 3, 5, 1],
+                },
+                RgbLedZoneConfig {
+                    zone_index: 1,
+                    led_indexes: vec![12, 9, 10],
+                },
+            ],
+        }],
+        effect_route: Vec::new(),
+        devices: Vec::new(),
+    });
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.fan_count = Some(3);
+    let capabilities = vec![rgb_capabilities(device_id, 3, 44)];
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetRgbCapabilities => IpcResponse::ok(capabilities.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["zones"][0]["led_indexes"], json!([7, 3, 5, 1]));
+    assert_eq!(body["zones"][1]["led_indexes"], json!([12, 9, 10]));
+}
+
+#[tokio::test]
+async fn lighting_zone_layout_get_falls_back_to_legacy_layout_when_fan_not_saved() {
+    let device_id = "wireless:test:zones";
+    let path = format!(
+        "/api/devices/{}/lighting/zone-layout?fan_index=3",
+        encoded_device_id(device_id)
+    );
+    let mut config = sample_device_config(device_id);
+    config.rgb = Some(RgbAppConfig {
+        enabled: true,
+        openrgb_server: false,
+        openrgb_port: 6743,
+        global_led_zones: vec![
+            RgbLedZoneConfig {
+                zone_index: 0,
+                led_indexes: vec![7, 3, 5, 1],
+            },
+            RgbLedZoneConfig {
+                zone_index: 1,
+                led_indexes: vec![12, 9, 10],
+            },
+        ],
+        fan_led_zones: vec![RgbFanLedZoneConfig {
+            device_id: device_id.to_string(),
+            fan_index: 2,
+            zones: vec![RgbLedZoneConfig {
+                zone_index: 0,
+                led_indexes: vec![40, 41],
+            }],
+        }],
+        effect_route: Vec::new(),
+        devices: Vec::new(),
+    });
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.fan_count = Some(3);
+    let capabilities = vec![rgb_capabilities(device_id, 3, 44)];
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetRgbCapabilities => IpcResponse::ok(capabilities.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["zones"][0]["led_indexes"], json!([7, 3, 5, 1]));
+    assert_eq!(body["zones"][1]["led_indexes"], json!([12, 9, 10]));
+}
+
+#[tokio::test]
+async fn lighting_zone_layout_save_stably_deduplicates_led_order() {
+    let device_id = "wireless:test:zones";
+    let path = format!(
+        "/api/devices/{}/lighting/zone-layout",
+        encoded_device_id(device_id)
+    );
+    let config = sample_device_config(device_id);
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.fan_count = Some(3);
+    let capabilities = vec![rgb_capabilities(device_id, 3, 44)];
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(4, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetRgbCapabilities => IpcResponse::ok(capabilities.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetConfig { .. } => IpcResponse::ok(json!(null)),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            json!({
+                "fan_index": 2,
+                "zones": [
+                    { "zone": 0, "led_indexes": [7, 3, 5, 7, 1] },
+                    { "zone": 1, "led_indexes": [5, 12, 9, 12, 10] },
+                    { "zone": 2, "led_indexes": [] },
+                    { "zone": 3, "led_indexes": [] },
+                    { "zone": 4, "led_indexes": [] }
+                ]
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["zones"][0]["led_indexes"], json!([7, 3, 5, 1]));
+    assert_eq!(body["zones"][1]["led_indexes"], json!([12, 9, 10]));
+
+    let requests = mock.join();
+    let IpcRequest::SetConfig { config } = &requests[3] else {
+        panic!("expected SetConfig request");
+    };
+    let rgb = config.rgb.as_ref().expect("rgb config");
+    assert_eq!(rgb.fan_led_zones.len(), 1);
+    assert_eq!(rgb.fan_led_zones[0].device_id, device_id);
+    assert_eq!(rgb.fan_led_zones[0].fan_index, 2);
+    assert_eq!(rgb.fan_led_zones[0].zones[0].led_indexes, vec![7, 3, 5, 1]);
+    assert_eq!(rgb.fan_led_zones[0].zones[1].led_indexes, vec![12, 9, 10]);
+}
+
+#[tokio::test]
+async fn lighting_workbench_apply_persists_rgb_config() {
+    let device_id = "wireless:test:lighting:workbench";
+    let config = sample_device_config(device_id);
+    let devices = vec![device_info(device_id, "RGB Workbench Device", true, true)];
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetRgbConfig { .. } => IpcResponse::ok(json!(null)),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/lighting/apply",
+            json!({
+                "target_mode": "selected",
+                "device_id": device_id,
+                "device_ids": [device_id],
+                "zone_mode": "all_zones",
+                "effect": "Static",
+                "brightness": 60,
+                "speed": 2,
+                "colors": [{ "hex": "#abcdef" }],
+                "direction": "Clockwise",
+                "scope": "All",
+                "sync_selected": false
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["applied_devices"][0]["device_id"], device_id);
+    assert_eq!(body["applied_devices"][0]["zones"][0]["colors"], json!(["#abcdef"]));
+
+    let requests = mock.join();
+    let IpcRequest::SetRgbConfig { config } = &requests[2] else {
+        panic!("expected SetRgbConfig request");
+    };
+    assert_eq!(config.devices[0].device_id, device_id);
+    assert_eq!(config.devices[0].zones[0].effect.colors[0], [0xab, 0xcd, 0xef]);
+    assert_eq!(config.devices[0].zones[0].effect.mode, RgbMode::Static);
+}
+
+#[tokio::test]
+async fn lighting_effect_route_roundtrips_in_saved_order() {
+    let config = sample_device_config("wireless:test:route");
+    let mock = MockDaemon::new(2, move |request| match request {
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetRgbConfig { config } => IpcResponse::ok(json!(config)),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::PUT,
+            "/api/lighting/effect-route",
+            json!({
+                "route": [
+                    { "device_id": "wireless:cluster-b", "fan_index": 2 },
+                    { "device_id": "wireless:cluster-a", "fan_index": 1 },
+                    { "device_id": "wireless:cluster-b", "fan_index": 3 }
+                ]
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(
+        body["route"],
+        json!([
+            { "device_id": "wireless:cluster-b", "fan_index": 2 },
+            { "device_id": "wireless:cluster-a", "fan_index": 1 },
+            { "device_id": "wireless:cluster-b", "fan_index": 3 }
+        ])
+    );
+
+    let requests = mock.join();
+    let IpcRequest::SetRgbConfig { config } = &requests[1] else {
+        panic!("expected SetRgbConfig request");
+    };
+    assert_eq!(config.effect_route.len(), 3);
+    assert_eq!(config.effect_route[0].device_id, "wireless:cluster-b");
+    assert_eq!(config.effect_route[0].fan_index, 2);
+    assert_eq!(config.effect_route[1].device_id, "wireless:cluster-a");
+    assert_eq!(config.effect_route[1].fan_index, 1);
+    assert_eq!(config.effect_route[2].device_id, "wireless:cluster-b");
+    assert_eq!(config.effect_route[2].fan_index, 3);
+}
+
+#[tokio::test]
+async fn lighting_effect_route_rejects_duplicate_entries() {
+    let config = sample_device_config("wireless:test:route");
+    let mock = MockDaemon::new(1, move |request| match request {
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::PUT,
+            "/api/lighting/effect-route",
+            json!({
+                "route": [
+                    { "device_id": "wireless:cluster-a", "fan_index": 1 },
+                    { "device_id": "wireless:cluster-a", "fan_index": 1 }
+                ]
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_api_error(
+        response,
+        StatusCode::BAD_REQUEST,
+        "BAD_REQUEST",
+        "bad request: duplicate lighting effect route entry for wireless:cluster-a fan 1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lighting_workbench_route_target_uses_saved_route_and_skips_missing_devices() {
+    let device_id = "wireless:test:lighting:route";
+    let mut config = sample_device_config(device_id);
+    if let Some(rgb) = config.rgb.as_mut() {
+        rgb.effect_route = vec![
+            lianli_shared::rgb::RgbEffectRouteEntry {
+                device_id: "wireless:missing".to_string(),
+                fan_index: 1,
+            },
+            lianli_shared::rgb::RgbEffectRouteEntry {
+                device_id: device_id.to_string(),
+                fan_index: 2,
+            },
+        ];
+    }
+    let devices = vec![device_info(device_id, "RGB Route Device", true, true)];
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetRgbConfig { .. } => IpcResponse::ok(json!(null)),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/lighting/apply",
+            json!({
+                "target_mode": "route",
+                "device_ids": [],
+                "zone_mode": "all_zones",
+                "effect": "Meteor",
+                "brightness": 60,
+                "speed": 2,
+                "colors": [{ "hex": "#abcdef" }],
+                "direction": "Clockwise",
+                "scope": "All",
+                "sync_selected": false
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(
+        body["requested_device_ids"],
+        json!(["wireless:missing", device_id])
+    );
+    assert_eq!(body["applied_devices"][0]["device_id"], device_id);
+    assert_eq!(body["skipped_devices"][0]["device_id"], "wireless:missing");
+}
+
+#[tokio::test]
 async fn fan_state_endpoint_returns_configured_slots_and_telemetry() {
     let device_id = "wireless:test:fan";
     let path = format!("/api/devices/{}/fans", encoded_device_id(device_id));
@@ -1345,6 +1888,208 @@ async fn fan_state_endpoint_returns_configured_slots_and_telemetry() {
 }
 
 #[tokio::test]
+async fn fan_state_endpoint_limits_wireless_slots_to_discovered_fan_count() {
+    let device_id = "wireless:test:fan";
+    let path = format!("/api/devices/{}/fans", encoded_device_id(device_id));
+    let config = sample_device_config(device_id);
+    let mut wireless_device = device_info(device_id, "Fan Device", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.fan_count = Some(3);
+    let devices = vec![wireless_device];
+    let telemetry = sample_telemetry(device_id);
+    let mock = MockDaemon::new(3, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::GetTelemetry => IpcResponse::ok(telemetry.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["slots"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["rpms"], json!([910, 920, 930]));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 3);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+    assert!(matches!(requests[1], IpcRequest::GetConfig));
+    assert!(matches!(requests[2], IpcRequest::GetTelemetry));
+}
+
+#[tokio::test]
+async fn refresh_wireless_discovery_endpoint_triggers_daemon_scan() {
+    let mock = MockDaemon::new(1, move |request| match request {
+        IpcRequest::RefreshWirelessDiscovery => {
+            IpcResponse::ok(json!({ "refreshed": true, "device_count": 3 }))
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::POST, "/api/wireless/discovery/refresh"))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body, json!({ "refreshed": true, "device_count": 3 }));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0], IpcRequest::RefreshWirelessDiscovery));
+}
+
+#[tokio::test]
+async fn connect_wireless_device_endpoint_binds_available_device() {
+    let device_id = "wireless:test:cluster";
+    let path = format!(
+        "/api/devices/{}/wireless/connect",
+        encoded_device_id(device_id)
+    );
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.wireless_binding_state = Some(WirelessBindingState::Available);
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(2, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::BindWirelessDevice { device_id } => {
+            IpcResponse::ok(json!({ "device_id": device_id, "connected": true }))
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::POST, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body, json!({ "device_id": device_id, "connected": true }));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+    assert!(matches!(
+        &requests[1],
+        IpcRequest::BindWirelessDevice { device_id: request_device_id }
+            if request_device_id == device_id
+    ));
+}
+
+#[tokio::test]
+async fn connect_wireless_device_endpoint_rejects_foreign_devices() {
+    let device_id = "wireless:test:foreign";
+    let path = format!(
+        "/api/devices/{}/wireless/connect",
+        encoded_device_id(device_id)
+    );
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    wireless_device.wireless_binding_state = Some(WirelessBindingState::Foreign);
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(1, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::POST, &path))
+        .await
+        .expect("send request");
+
+    assert_api_error(
+        response,
+        StatusCode::BAD_REQUEST,
+        "BAD_REQUEST",
+        "bad request: device is currently paired to another controller",
+    )
+    .await;
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+}
+#[tokio::test]
+async fn disconnect_wireless_device_endpoint_unbinds_wireless_device() {
+    let device_id = "wireless:test:cluster";
+    let path = format!(
+        "/api/devices/{}/wireless/disconnect",
+        encoded_device_id(device_id)
+    );
+    let mut wireless_device = device_info(device_id, "Wireless Cluster", true, true);
+    wireless_device.wireless_channel = Some(8);
+    let devices = vec![wireless_device];
+    let mock = MockDaemon::new(2, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::UnbindWirelessDevice { device_id } => {
+            IpcResponse::ok(json!({ "device_id": device_id, "disconnected": true }))
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::POST, &path))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body, json!({ "device_id": device_id, "disconnected": true }));
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+    assert!(matches!(
+        &requests[1],
+        IpcRequest::UnbindWirelessDevice { device_id: request_device_id }
+            if request_device_id == device_id
+    ));
+}
+
+#[tokio::test]
+async fn disconnect_wireless_device_endpoint_rejects_wired_devices() {
+    let device_id = "usb:test:controller";
+    let path = format!(
+        "/api/devices/{}/wireless/disconnect",
+        encoded_device_id(device_id)
+    );
+    let devices = vec![device_info(device_id, "USB Controller", true, true)];
+    let mock = MockDaemon::new(1, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::POST, &path))
+        .await
+        .expect("send request");
+
+    assert_api_error(
+        response,
+        StatusCode::BAD_REQUEST,
+        "BAD_REQUEST",
+        "bad request: device is not a wireless device",
+    )
+    .await;
+
+    let requests = mock.join();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0], IpcRequest::ListDevices));
+}
+
+#[tokio::test]
 async fn fan_manual_endpoint_updates_fan_config() {
     let device_id = "wireless:test:fan";
     let path = format!(
@@ -1353,10 +2098,11 @@ async fn fan_manual_endpoint_updates_fan_config() {
     );
     let config = sample_device_config(device_id);
     let devices = vec![device_info(device_id, "Fan Device", true, true)];
-    let mock = MockDaemon::new(3, move |request| match request {
+    let mock = MockDaemon::new(4, move |request| match request {
         IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
         IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
         IpcRequest::SetFanConfig { .. } => IpcResponse::ok(json!(null)),
+        IpcRequest::GetTelemetry => IpcResponse::ok(TelemetrySnapshot::default()),
         other => panic!("unexpected request: {other:?}"),
     });
 
@@ -1393,6 +2139,137 @@ async fn fan_manual_endpoint_updates_fan_config() {
         FanSpeed::Constant(pwm) => assert_eq!(*pwm, 140),
         other => panic!("expected manual fan speed, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn fan_manual_endpoint_clamps_single_wireless_slinf_to_stable_minimum() {
+    let device_id = "wireless:test:single";
+    let path = format!(
+        "/api/devices/{}/fans/manual",
+        encoded_device_id(device_id)
+    );
+    let config = sample_device_config(device_id);
+    let devices = vec![DeviceInfo {
+        device_id: device_id.to_string(),
+        family: DeviceFamily::SlInf,
+        name: "Single SL-INF".to_string(),
+        serial: None,
+        wireless_channel: Some(8),
+        wireless_missed_polls: None,
+        wireless_master_mac: Some("3b:59:87:e5:66:e4".to_string()),
+        wireless_binding_state: Some(WirelessBindingState::Connected),
+        has_lcd: false,
+        has_fan: true,
+        has_pump: false,
+        has_rgb: true,
+        fan_count: Some(1),
+        per_fan_control: Some(false),
+        mb_sync_support: false,
+        rgb_zone_count: Some(3),
+        screen_width: None,
+        screen_height: None,
+    }];
+    let mock = MockDaemon::new(4, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetFanConfig { .. } => IpcResponse::ok(json!(null)),
+        IpcRequest::GetTelemetry => IpcResponse::ok(TelemetrySnapshot::default()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            json!({
+                "percent": 20
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["slots"][0]["percent"], 30);
+    assert_eq!(body["slots"][0]["pwm"], 77);
+
+    let requests = mock.join();
+    let IpcRequest::SetFanConfig { config } = &requests[2] else {
+        panic!("expected SetFanConfig request");
+    };
+    let group = config
+        .speeds
+        .iter()
+        .find(|group| group.device_id.as_deref() == Some(device_id))
+        .expect("fan group");
+    match &group.speeds[0] {
+        FanSpeed::Constant(pwm) => assert_eq!(*pwm, 77),
+        other => panic!("expected manual fan speed, got {other:?}"),
+    }
+}
+
+fn rgb_capabilities(device_id: &str, fan_count: u8, leds_per_fan: u16) -> RgbDeviceCapabilities {
+    RgbDeviceCapabilities {
+        device_id: device_id.to_string(),
+        device_name: "UNI FAN SL-INF Wireless".to_string(),
+        supported_modes: vec![RgbMode::Static, RgbMode::Direct],
+        zones: Vec::new(),
+        supports_direct: true,
+        supports_mb_rgb_sync: false,
+        total_led_count: fan_count as u16 * leds_per_fan,
+        supported_scopes: Vec::new(),
+        supports_direction: false,
+    }
+}
+
+#[tokio::test]
+async fn fan_workbench_apply_persists_fan_config() {
+    let device_id = "wireless:test:fan:workbench";
+    let config = sample_device_config(device_id);
+    let devices = vec![device_info(device_id, "Fan Workbench Device", true, true)];
+    let mock = MockDaemon::new(4, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetConfig => IpcResponse::ok(config.clone()),
+        IpcRequest::SetFanConfig { .. } => IpcResponse::ok(json!(null)),
+        IpcRequest::GetTelemetry => IpcResponse::ok(TelemetrySnapshot::default()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/fans/apply",
+            json!({
+                "target_mode": "selected",
+                "device_id": device_id,
+                "device_ids": [device_id],
+                "mode": "manual",
+                "percent": 45
+            }),
+        ))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    assert_eq!(body["applied_devices"][0]["device_id"], device_id);
+    assert_eq!(body["applied_devices"][0]["slots"][0]["percent"], 45);
+
+    let requests = mock.join();
+    let IpcRequest::SetFanConfig { config } = &requests[2] else {
+        panic!("expected SetFanConfig request");
+    };
+    let group = config
+        .speeds
+        .iter()
+        .find(|group| group.device_id.as_deref() == Some(device_id))
+        .expect("fan group");
+    assert!(group
+        .speeds
+        .iter()
+        .all(|speed| matches!(speed, FanSpeed::Constant(115))));
 }
 
 #[tokio::test]
@@ -2388,3 +3265,16 @@ async fn profile_apply_returns_not_found_for_unknown_target_device() {
     assert_eq!(requests.len(), 1);
     assert!(matches!(requests[0], IpcRequest::ListDevices));
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
