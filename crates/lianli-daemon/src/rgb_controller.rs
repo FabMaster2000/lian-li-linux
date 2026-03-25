@@ -282,7 +282,7 @@ fn wireless_supported_modes(fan_type: WirelessFanType) -> Vec<RgbMode> {
 }
 
 fn effect_is_route_aware(mode: RgbMode) -> bool {
-    matches!(mode, RgbMode::Wave | RgbMode::TailChasing)
+    matches!(mode, RgbMode::Wave | RgbMode::TailChasing | RgbMode::Meteor)
 }
 
 fn effect_is_animated(mode: RgbMode) -> bool {
@@ -403,63 +403,74 @@ fn build_wireless_route_render_plans(
     }
 
     if effect.mode == RgbMode::Meteor {
-        let segment_count = segments.len().max(1);
-        let base_frame_count = if animated_effect {
-            (frame_count / segment_count).max(1)
-        } else {
-            1
-        };
-        let total_cycle_frames = frame_count;
+        // Cross-cluster Meteor sweep: the trail travels across all fans in
+        // route order, identical to L-Connect's merging behaviour.
+        let palette = palette_from_effect(effect);
+        let color = palette[0];
+        let trail_len = METEOR_TRAIL_TABLE.len();
+        let reversed = effect.direction == RgbDirection::CounterClockwise;
 
-        for (segment_idx, segment) in segments.iter().enumerate() {
+        // Build per-LED entries with a *global* row offset that spans every
+        // fan in the route, so the sweep crosses device boundaries.
+        struct LedEntry {
+            device_id: String,
+            dst_index: usize,
+            global_row: usize,
+        }
+        let mut led_entries: Vec<LedEntry> = Vec::new();
+        let mut global_fan_idx: usize = 0; // sequential position in route
+
+        for segment in &segments {
             let Some(state) = wireless_state.get(&segment.device_id) else {
+                global_fan_idx += 1;
                 continue;
             };
-            let Some(plan) = plans.get_mut(&segment.device_id) else {
-                continue;
-            };
+            let fan_row_offset = global_fan_idx * METEOR_ROWS_PER_FAN;
+            let fan_led_count = segment.led_indexes.len();
+            let fan_base = segment.fan_slot_index * state.leds_per_fan as usize;
 
-            let segment_frames = render_zone_frames(
-                &WirelessZoneSource::Effect(effect.clone()),
-                segment.led_indexes.len(),
-                animated_effect,
-            );
-
-            let reverse_idx = segment_count - 1 - segment_idx;
-            let window_start = reverse_idx * base_frame_count;
-            let window_end = window_start + base_frame_count;
-
-            for frame_idx in 0..frame_count {
-                let cycle_frame = if animated_effect {
-                    frame_idx % total_cycle_frames
+            for (t_idx, &led_index) in segment.led_indexes.iter().enumerate() {
+                let local_row = if fan_led_count > 0 {
+                    t_idx * METEOR_ROWS_PER_FAN / fan_led_count
                 } else {
                     0
                 };
+                led_entries.push(LedEntry {
+                    device_id: segment.device_id.clone(),
+                    dst_index: fan_base + led_index,
+                    global_row: fan_row_offset + local_row,
+                });
+            }
+            global_fan_idx += 1;
+        }
 
-                if animated_effect {
-                    if cycle_frame < window_start || cycle_frame >= window_end {
-                        continue;
-                    }
+        let total_rows = global_fan_idx * METEOR_ROWS_PER_FAN;
+        let active_frames = (total_rows + trail_len - 1).min(frame_count);
+        let start_offset = if reversed { frame_count.saturating_sub(active_frames) } else { 0 };
+
+        for step in 0..active_frames {
+            let frame_idx = start_offset + step;
+            let head_row = if reversed {
+                total_rows.saturating_sub(1).saturating_sub(step.min(total_rows.saturating_sub(1)))
+            } else {
+                step
+            };
+
+            for entry in &led_entries {
+                let distance = if reversed {
+                    entry.global_row as isize - head_row as isize
+                } else {
+                    head_row as isize - entry.global_row as isize
+                };
+                if distance < 0 || distance >= trail_len as isize {
+                    continue;
                 }
-
-                let source_frame_idx = if animated_effect {
-                    let local_idx = cycle_frame
-                        .saturating_sub(window_start)
-                        .min(base_frame_count.saturating_sub(1));
-                    if base_frame_count <= 1 {
-                        0
-                    } else {
-                        (local_idx * (WIRELESS_EFFECT_FRAMES - 1)) / (base_frame_count - 1)
-                    }
-                } else {
-                    0
+                let intensity = METEOR_TRAIL_TABLE[distance as usize];
+                let Some(plan) = plans.get_mut(&entry.device_id) else {
+                    continue;
                 };
-                let frame = &segment_frames[source_frame_idx];
-                for (offset, led_index) in segment.led_indexes.iter().enumerate() {
-                    let dst_index = segment.fan_slot_index * state.leds_per_fan as usize + led_index;
-                    if let Some(color) = frame.get(offset) {
-                        plan.frames[frame_idx][dst_index] = *color;
-                    }
+                if entry.dst_index < plan.frames[frame_idx].len() {
+                    plan.frames[frame_idx][entry.dst_index] = scale_color(color, intensity);
                 }
             }
         }
@@ -802,6 +813,23 @@ impl RgbController {
                 };
 
                 if effect_is_route_aware(effect.mode) {
+                    // Skip if ALL zone_sources on this device already match
+                    // (route sends mark every zone, so subsequent zone calls
+                    //  for the same effect can be skipped).
+                    let target_state = self
+                        .wireless_state
+                        .get(device_id)
+                        .expect("checked above");
+                    let route_already_applied = target_state.zone_sources.iter().all(|src| {
+                        matches!(src, WirelessZoneSource::Effect(e) if *e == *effect)
+                    });
+                    if route_already_applied {
+                        debug!(
+                            "Skipped redundant routed Meteor send for {device_id} zone {zone}"
+                        );
+                        return Ok(());
+                    }
+
                     let route_plans = self
                         .config
                         .as_ref()
@@ -822,17 +850,69 @@ impl RgbController {
                         .unwrap_or_default();
 
                     if !route_plans.is_empty() {
-                        for (route_device_id, plan) in route_plans {
-                            let Some(route_state) = self.wireless_state.get_mut(&route_device_id)
-                            else {
-                                continue;
-                            };
-                            if zone_idx < route_state.zone_sources.len() {
-                                route_state.zone_sources[zone_idx] =
-                                    WirelessZoneSource::Effect(effect.clone());
+                        // Collect plans for round-robin sending.  Cross-cluster
+                        // animations need all devices to start at roughly the
+                        // same time.  Sending device-by-device with 3 passes
+                        // each would offset them by seconds; round-robin sends
+                        // all devices once per pass, keeping them in sync.
+                        let plans_vec: Vec<(String, WirelessRenderPlan)> =
+                            route_plans.into_iter().collect();
+
+                        // Mark ALL zone_sources on ALL route devices so
+                        // subsequent zone calls hit the redundancy skip.
+                        for (route_device_id, _) in &plans_vec {
+                            if let Some(route_state) =
+                                self.wireless_state.get_mut(route_device_id)
+                            {
+                                for zs in route_state.zone_sources.iter_mut() {
+                                    *zs = WirelessZoneSource::Effect(effect.clone());
+                                }
                             }
-                            send_wireless_render_plan(wireless, route_state, plan, 4)?;
                         }
+
+                        // Round-robin multi-pass (L-Connect style).
+                        for pass in 0..ANIMATED_SEND_PASSES {
+                            for (route_device_id, plan) in &plans_vec {
+                                let Some(route_state) =
+                                    self.wireless_state.get_mut(route_device_id)
+                                else {
+                                    continue;
+                                };
+                                route_state.effect_counter =
+                                    route_state.effect_counter.wrapping_add(1);
+                                let idx = route_state.effect_counter.to_be_bytes();
+                                if plan.animated {
+                                    wireless.send_rgb_frames(
+                                        &route_state.mac,
+                                        &plan.frames,
+                                        plan.interval_ms,
+                                        &idx,
+                                        4,
+                                    )?;
+                                } else {
+                                    let frame = plan
+                                        .frames
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            vec![[0, 0, 0]; route_state.led_state.len()]
+                                        });
+                                    route_state.led_state = frame.clone();
+                                    wireless.send_rgb_direct(
+                                        &route_state.mac,
+                                        &frame,
+                                        &idx,
+                                        4,
+                                    )?;
+                                }
+                            }
+                            if pass < ANIMATED_SEND_PASSES - 1 {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    ANIMATED_SEND_PASS_DELAY_MS,
+                                ));
+                            }
+                        }
+
                         debug!(
                             "Set routed wireless RGB on {device_id} zone {zone}: {:?}, {} cluster LEDs",
                             effect.mode, cluster_led_count
@@ -851,10 +931,10 @@ impl RgbController {
                 // rather than rebuilding + re-sending for each of the 5 zones.
                 if state.fan_type == WirelessFanType::SlInf && effect.mode == RgbMode::Meteor {
                     let already_applied = state.zone_sources.iter().all(|src| {
-                        matches!(src, WirelessZoneSource::Effect(e) if e.mode == RgbMode::Meteor)
+                        matches!(src, WirelessZoneSource::Effect(e) if *e == *effect)
                     });
                     if already_applied {
-                        // All zones already set to Meteor — skip redundant RF send
+                        // All zones already set to the exact same Meteor effect — skip redundant RF send
                         debug!(
                             "Skipped redundant Meteor send for {device_id} zone {zone}"
                         );
@@ -1075,8 +1155,12 @@ impl RgbController {
         self.wireless_state.contains_key(device_id)
     }
 
+    /// Whether any wireless devices are currently registered for RGB.
+    pub fn has_wireless_devices(&self) -> bool {
+        !self.wireless_state.is_empty()
+    }
+
     /// Refresh wireless device list (call after rediscovery / hot-plug).
-    #[allow(dead_code)]
     pub fn refresh_wireless_devices(&mut self) {
         if let Some(ref w) = self.wireless {
             let mut new_state = HashMap::new();
@@ -1569,24 +1653,38 @@ fn rebuild_wireless_render_plan(state: &mut WirelessRgbState) -> anyhow::Result<
     Ok(WirelessRenderPlan { frames, animated, interval_ms })
 }
 
+/// Number of times to send animated effect data for reliability.
+/// L-Connect re-sends continuously every ~500ms; we send multiple passes
+/// up-front so the fan is very likely to receive at least one clean copy.
+const ANIMATED_SEND_PASSES: u8 = 3;
+/// Delay between animated send passes (ms).  Matches L-Connect's ~500ms
+/// round-robin cycle period.
+const ANIMATED_SEND_PASS_DELAY_MS: u64 = 500;
+
 fn send_wireless_render_plan(
     wireless: &WirelessController,
     state: &mut WirelessRgbState,
     plan: WirelessRenderPlan,
     header_repeats: u8,
 ) -> anyhow::Result<()> {
-    state.effect_counter = state.effect_counter.wrapping_add(1);
-    let idx = state.effect_counter.to_be_bytes();
-
     if plan.animated {
-        wireless.send_rgb_frames(
-            &state.mac,
-            &plan.frames,
-            plan.interval_ms,
-            &idx,
-            header_repeats,
-        )?;
+        for pass in 0..ANIMATED_SEND_PASSES {
+            state.effect_counter = state.effect_counter.wrapping_add(1);
+            let idx = state.effect_counter.to_be_bytes();
+            wireless.send_rgb_frames(
+                &state.mac,
+                &plan.frames,
+                plan.interval_ms,
+                &idx,
+                header_repeats,
+            )?;
+            if pass < ANIMATED_SEND_PASSES - 1 {
+                std::thread::sleep(std::time::Duration::from_millis(ANIMATED_SEND_PASS_DELAY_MS));
+            }
+        }
     } else {
+        state.effect_counter = state.effect_counter.wrapping_add(1);
+        let idx = state.effect_counter.to_be_bytes();
         let frame = plan
             .frames
             .into_iter()
@@ -1881,11 +1979,14 @@ mod tests {
         };
 
         let plans = build_wireless_route_render_plans(&wireless_state, &route, 0, &effect);
-        let logical_frame = render_wireless_effect_frame(&effect, 2, 0, WIRELESS_EFFECT_FRAMES);
 
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans["wireless:a"].frames[0][2], logical_frame[0]);
-        assert_eq!(plans["wireless:a"].frames[0][0], logical_frame[1]);
+        // Trail head at row 0 (frame 0): LED index 2 (traversal pos 0, row 0) is lit.
+        assert_eq!(plans["wireless:a"].frames[0][2], [255, 0, 0]);
+        // LED index 0 (traversal pos 1, row 4) is not yet reached at frame 0.
+        assert_eq!(plans["wireless:a"].frames[0][0], [0, 0, 0]);
+        // By frame 4 the head reaches row 4, so LED index 0 is the head.
+        assert_eq!(plans["wireless:a"].frames[4][0], [255, 0, 0]);
     }
 
     #[test]
@@ -1931,21 +2032,21 @@ mod tests {
         };
 
         let plans = build_wireless_route_render_plans(&wireless_state, &route, 0, &effect);
-        let logical_frame = render_wireless_effect_frame(&effect, 2, 0, WIRELESS_EFFECT_FRAMES);
 
         assert_eq!(plans.len(), 2);
         assert_eq!(plans["wireless:a"].frames.len(), WIRELESS_EFFECT_FRAMES);
 
-        // Reversed and sequential: route segment B runs first, then segment A.
-        assert_eq!(plans["wireless:b"].frames[0][3], logical_frame[0]);
-        assert_eq!(plans["wireless:b"].frames[0][2], logical_frame[1]);
-        assert_eq!(plans["wireless:a"].frames[0][1], [0, 0, 0]);
-        assert_eq!(plans["wireless:a"].frames[0][0], [0, 0, 0]);
+        // Trail sweeps in route order: device A first, then device B.
+        // Frame 0: head at global row 0 → device A, LED index 1 (row 0) is lit.
+        assert_eq!(plans["wireless:a"].frames[0][1], [0x77, 0xaa, 0xff]);
+        assert_eq!(plans["wireless:a"].frames[0][0], [0, 0, 0]); // row 4, not reached
+        assert_eq!(plans["wireless:b"].frames[0][3], [0, 0, 0]); // row 8, not reached
+        assert_eq!(plans["wireless:b"].frames[0][2], [0, 0, 0]); // row 12, not reached
 
-        assert_eq!(plans["wireless:a"].frames[WIRELESS_EFFECT_FRAMES / 2][1], logical_frame[0]);
-        assert_eq!(plans["wireless:a"].frames[WIRELESS_EFFECT_FRAMES / 2][0], logical_frame[1]);
-        assert_eq!(plans["wireless:b"].frames[WIRELESS_EFFECT_FRAMES / 2][3], [0, 0, 0]);
-        assert_eq!(plans["wireless:b"].frames[WIRELESS_EFFECT_FRAMES / 2][2], [0, 0, 0]);
+        // Frame 8: head at global row 8 → device B, LED index 3 (row 8) is the head.
+        // Device A, LED index 1 (row 0) is in the trail (distance 8, intensity 0.084).
+        assert_eq!(plans["wireless:b"].frames[8][3], [0x77, 0xaa, 0xff]);
+        assert_ne!(plans["wireless:a"].frames[8][1], [0, 0, 0]); // still in trail
     }
 
     #[test]

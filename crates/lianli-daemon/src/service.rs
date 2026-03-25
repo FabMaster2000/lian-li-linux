@@ -59,6 +59,9 @@ pub struct ServiceManager {
     hid_backends: HashMap<String, Arc<Mutex<HidBackend>>>,
     last_device_scan: Instant,
     last_usb_enum: Instant,
+    /// Set once wireless devices have been registered into the RGB controller
+    /// and the saved config has been re-applied to them.
+    wireless_rgb_applied: bool,
     /// Cached USB device list from enumerate_devices() — refreshed every USB_ENUM_INTERVAL.
     cached_usb_devices: Vec<DeviceInfo>,
     running: bool,
@@ -91,6 +94,7 @@ impl ServiceManager {
             hid_backends: HashMap::new(),
             last_device_scan: Instant::now() - DEVICE_POLL_INTERVAL,
             last_usb_enum: Instant::now() - USB_ENUM_INTERVAL,
+            wireless_rgb_applied: false,
             cached_usb_devices: Vec::new(),
             running: true,
             restart_requested: false,
@@ -231,6 +235,7 @@ impl ServiceManager {
                     self.refresh_usb_device_cache();
                 }
                 self.sync_ipc_telemetry();
+                self.refresh_wireless_rgb_state();
             }
 
             self.stream_targets();
@@ -360,6 +365,25 @@ impl ServiceManager {
         ipc_state.devices = devices;
     }
 
+    /// Synchronise the RGB controller's wireless device map with live discovery
+    /// results and, on the first successful population, re-apply the saved
+    /// RGB config so effects reach devices that were discovered after startup.
+    fn refresh_wireless_rgb_state(&mut self) {
+        if let Some(ref rgb) = self.rgb_controller {
+            let mut ctrl = rgb.lock();
+            ctrl.refresh_wireless_devices();
+
+            // Once wireless devices appear for the first time, re-apply the
+            // saved config so the user's effects are sent to them.
+            if !self.wireless_rgb_applied && ctrl.has_wireless_devices() {
+                drop(ctrl);
+                info!("Wireless devices now available — applying saved RGB config");
+                self.apply_rgb_config();
+                self.wireless_rgb_applied = true;
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         for target in self.targets.values_mut() {
             target.stop();
@@ -417,7 +441,7 @@ impl ServiceManager {
         // Reuse the already-opened wired fan device handles (populated at startup).
         let wired_devices = Arc::clone(&self.wired_fan_devices);
 
-        let wireless = if self.wireless.has_discovered_devices() {
+        let wireless = if self.wireless.is_open() {
             Some(Arc::new(self.wireless.clone()))
         } else {
             None
@@ -577,7 +601,11 @@ impl ServiceManager {
         &mut self,
         wired_rgb: HashMap<String, Box<dyn lianli_devices::traits::RgbDevice>>,
     ) {
-        let wireless = if self.wireless.has_discovered_devices() {
+        // Always pass the wireless controller when TX/RX are open.
+        // Device discovery is asynchronous — the Arc-shared discovered_devices
+        // list will be populated by the RX polling thread.  refresh_wireless_devices()
+        // in the main loop picks up newly-discovered devices later.
+        let wireless = if self.wireless.is_open() {
             Some(Arc::new(self.wireless.clone()))
         } else {
             None

@@ -205,7 +205,7 @@ pub enum RgbScope {
 }
 
 /// A complete RGB effect definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RgbEffect {
     pub mode: RgbMode,
     /// Up to 4 RGB colors.

@@ -39,7 +39,7 @@ nohup env \
   HOME="$HOME" \
   XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
   XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  "$repo_dir/target/debug/lianli-daemon" --config "$daemon_config_path" --log-level info \
+  "$repo_dir/target/debug/lianli-daemon" --config "$daemon_config_path" --log-level debug \
   >"$artifacts_dir/wsl-daemon.log" 2>&1 &
 echo $! >/tmp/lianli-daemon.pid
 

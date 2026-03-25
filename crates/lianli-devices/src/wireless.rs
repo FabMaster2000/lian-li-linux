@@ -29,7 +29,6 @@ const RF_CHUNK_SIZE: usize = 60;
 const RF_CHUNKS: usize = RF_DATA_SIZE / RF_CHUNK_SIZE;
 
 static CMD_RESET: Lazy<Vec<u8>> = Lazy::new(|| decode_command("11080000"));
-static CMD_VIDEO_START: Lazy<Vec<u8>> = Lazy::new(|| decode_command("11010000"));
 static CMD_RX_QUERY_34: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010434"));
 static CMD_RX_QUERY_37: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010437"));
 static CMD_RX_LCD_MODE: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010430"));
@@ -751,36 +750,47 @@ impl WirelessController {
             return Ok(());
         }
 
-        if self.video_mode_active.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
+        // L-Connect sends 0x11+prep every ~1.1 s — the TX dongle firmware
+        // appears to have an idle timeout for video-relay mode.  We therefore
+        // re-send unconditionally on every RGB transfer instead of caching.
         if let Some(tx) = &self.tx {
+            let master_ch = *self.master_channel.lock();
+            let master_mac = *self.master_mac.lock();
+
             let handle = tx.lock();
+
+            // CMD_VIDEO_START: byte[0]=0x11, byte[1]=master_channel.
+            // L-Connect sends this with the actual RF channel, NOT hardcoded.
+            let mut video_start = vec![0u8; 64];
+            video_start[0] = USB_CMD_GET_MAC; // 0x11 — video start command
+            video_start[1] = master_ch;
             handle
-                .write_bulk(&CMD_VIDEO_START, USB_TIMEOUT)
+                .write_bulk(&video_start, USB_TIMEOUT)
                 .context("sending TX video start")?;
             thread::sleep(Duration::from_millis(2));
 
-            let devices = self.discovered_devices.lock();
-            let device_count = devices.len().max(1);
-            let master_ch = *self.master_channel.lock();
+            // Prep broadcast: a proper 4-chunk RF frame with rx_type=0xFF.
+            // rf_data[0]=RF_SELECT, rf_data[1]=0x14 (prep sub-cmd),
+            // rf_data[2..8]=broadcast MAC (zeros), rf_data[8..14]=master_mac.
+            let mut rf_data = vec![0u8; RF_DATA_SIZE];
+            rf_data[0] = RF_SELECT;     // 0x12
+            rf_data[1] = 0x14;          // Prep sub-command
+            // rf_data[2..8] = 00 00 00 00 00 00  (broadcast target — already zero)
+            rf_data[8..14].copy_from_slice(&master_mac);
 
-            for device_idx in 0..device_count {
-                let mut cmd = vec![0u8; 64];
-                cmd[0] = USB_CMD_SEND_RF;
-                cmd[1] = device_idx as u8;
-                cmd[2] = master_ch;
-                cmd[3] = 0xFF; // Prep marker
-                handle
-                    .write_bulk(&cmd, USB_TIMEOUT)
-                    .context("sending TX prep command")?;
-                thread::sleep(Duration::from_millis(1));
-            }
+            send_control_rf_payload(
+                &handle,
+                master_ch,
+                0xFF, // broadcast rx_type
+                &rf_data,
+                1,
+                Duration::ZERO,
+                "video prep",
+            )?;
 
             drop(handle);
             self.video_mode_active.store(true, Ordering::Release);
-            info!("Video mode activated with {device_count} device(s)");
+            debug!("Video mode refreshed (ch={master_ch})");
         }
         Ok(())
     }
@@ -847,6 +857,11 @@ impl WirelessController {
     /// Whether any wireless devices have been discovered.
     pub fn has_discovered_devices(&self) -> bool {
         !self.discovered_devices.lock().is_empty()
+    }
+
+    /// Whether the TX USB transport is open (i.e. `connect()` succeeded).
+    pub fn is_open(&self) -> bool {
+        self.tx.is_some() || self.simulated.is_some()
     }
 
     /// Number of discovered wireless devices.
@@ -1308,6 +1323,11 @@ impl WirelessController {
         }
 
         let tx = self.tx.as_ref().context("TX device not connected")?;
+
+        // The TX dongle must be in "video mode" before it will relay RF RGB
+        // packets to the fans.  ensure_video_mode() is idempotent and fast
+        // when already active.
+        self.ensure_video_mode()?;
 
         let device = self
             .discovered_devices
