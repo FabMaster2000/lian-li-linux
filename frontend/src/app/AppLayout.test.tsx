@@ -89,11 +89,7 @@ describe("AppLayout", () => {
     const devicesLink = screen
       .getAllByRole("link")
       .find((link) => link.getAttribute("href") === "/devices");
-    const profilesLink = screen
-      .getAllByRole("link")
-      .find((link) => link.getAttribute("href") === "/profiles");
 
     expect(devicesLink).toBeDefined();
-    expect(profilesLink).toBeDefined();
   });
 });

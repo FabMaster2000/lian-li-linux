@@ -104,11 +104,8 @@ describe("LightingPage", () => {
       setEffect: vi.fn(),
       color: "#aabbcc",
       setColor: vi.fn(),
-      routeDraft: [
-        { key: "wireless:one::1", deviceId: "wireless:one", fanIndex: 1, label: "Desk cluster · Lüfter 1" },
-        { key: "wireless:one::2", deviceId: "wireless:one", fanIndex: 2, label: "Desk cluster · Lüfter 2" },
-      ],
-      reorderRouteEntry: vi.fn(),
+      speed: 10,
+      setSpeed: vi.fn(),
       dirty: true,
       rgbSummary: "Static #112233",
       refresh: vi.fn(),
@@ -126,9 +123,6 @@ describe("LightingPage", () => {
     expect(screen.getByRole("heading", { name: "RGB-Einstellung" })).toBeInTheDocument();
     expect(screen.getByText("Static #112233")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Übernehmen" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Lüfterreihenfolge" })).toBeInTheDocument();
-    expect(screen.getByText("Desk cluster · Lüfter 1")).toBeInTheDocument();
-    expect(screen.getByText("Desk cluster · Lüfter 2")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Auf alle Cluster übertragen" }),
     ).not.toBeInTheDocument();
@@ -154,8 +148,8 @@ describe("LightingPage", () => {
       setEffect: vi.fn(),
       color: "#ffffff",
       setColor: vi.fn(),
-      routeDraft: [],
-      reorderRouteEntry: vi.fn(),
+      speed: 10,
+      setSpeed: vi.fn(),
       dirty: false,
       rgbSummary: "n/a",
       refresh: vi.fn(),

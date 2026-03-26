@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ActionBar } from "../components/feedback/ActionBar";
 import { EmptyState } from "../components/feedback/EmptyState";
 import { InlineNotice } from "../components/feedback/InlineNotice";
 import { ColorField } from "../components/forms/ColorField";
+import { SliderField } from "../components/forms/SliderField";
 import { PageIntro } from "../components/PageIntro";
 import { Panel } from "../components/ui/Panel";
 import { StatusBadge } from "../components/ui/StatusBadge";
@@ -14,7 +15,6 @@ import type { RgbEffectChoice } from "../hooks/useMvpRgbPageData";
 export function LightingPage() {
   useDocumentTitle("RGB - Lian Li Control Surface");
   const [searchParams, setSearchParams] = useSearchParams();
-  const [draggedRouteKey, setDraggedRouteKey] = useState<string | null>(null);
   const requestedClusterId = searchParams.get("cluster");
   const requestedDeviceId = searchParams.get("device");
   const {
@@ -34,8 +34,8 @@ export function LightingPage() {
     setEffect,
     color,
     setColor,
-    routeDraft,
-    reorderRouteEntry,
+    speed,
+    setSpeed,
     dirty,
     rgbSummary,
     refresh,
@@ -192,43 +192,18 @@ export function LightingPage() {
               onChange={setColor}
               value={color}
             />
+            {effect === "Meteor" ? (
+              <SliderField
+                disabled={!selectedCluster || applyDisabled}
+                label="Geschwindigkeit"
+                min={0}
+                max={20}
+                onChange={setSpeed}
+                suffix=""
+                value={speed}
+              />
+            ) : null}
           </Panel>
-
-          {effect === "Meteor" && routeDraft.length > 0 ? (
-            <Panel
-              eyebrow="reihenfolge"
-              title="Lüfterreihenfolge"
-              description="Per Drag & Drop die Reihenfolge festlegen, in der Meteor über die Lüfter läuft."
-            >
-              <ol className="zone-order-list">
-                {routeDraft.map((entry, index) => (
-                  <li
-                    className={`zone-order-item${draggedRouteKey === entry.key ? " zone-order-item--dragging" : ""}`}
-                    draggable
-                    key={entry.key}
-                    onDragEnd={() => setDraggedRouteKey(null)}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDragStart={() => setDraggedRouteKey(entry.key)}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      if (draggedRouteKey) {
-                        reorderRouteEntry(draggedRouteKey, entry.key);
-                      }
-                      setDraggedRouteKey(null);
-                    }}
-                  >
-                    <span className="zone-order-item__position">#{index + 1}</span>
-                    <div>
-                      <div className="zone-order-item__label">{entry.label}</div>
-                      <div className="zone-order-item__hint">
-                        {entry.deviceId} · Fan {entry.fanIndex}
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            </Panel>
-          ) : null}
 
           <ActionBar
             summary={

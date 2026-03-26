@@ -55,10 +55,6 @@ export function isMvpRgbEffect(effect: string) {
   return mvpRgbEffectValueSet.has(effect);
 }
 
-export function isRouteAwareMvpRgbEffect(effect: string) {
-  return effect === "Meteor";
-}
-
 export const lightingDirectionOptions = [
   { value: "Clockwise", label: "Clockwise" },
   { value: "CounterClockwise", label: "Counter-clockwise" },
@@ -80,7 +76,7 @@ export const lightingPresetCatalog: LightingPreset[] = [
   {
     id: "meteor-default",
     label: "Meteor",
-    description: "Meteor trail animation across the configured fan route.",
+    description: "Meteor trail animation across all fans.",
     effect: "Meteor",
     colors: ["#ff3b30"],
     brightness: 85,

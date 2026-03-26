@@ -219,19 +219,6 @@ export type LightingZoneLayoutSaveRequest = {
   zones: LightingLedZoneConfigDocument[];
 };
 
-export type LightingEffectRouteEntryDocument = {
-  device_id: string;
-  fan_index: number;
-};
-
-export type LightingEffectRouteResponse = {
-  route: LightingEffectRouteEntryDocument[];
-};
-
-export type LightingEffectRouteSaveRequest = {
-  route: LightingEffectRouteEntryDocument[];
-};
-
 export type LightingLedProbeRequest = {
   fan_index: number;
   led_index: number;

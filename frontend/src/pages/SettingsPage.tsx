@@ -20,7 +20,7 @@ export function SettingsPage() {
       >
         <p>
           Die RGB-Steuerung ist auf den Meteor-Workflow reduziert. Verwende die RGB-Effekte-Seite,
-          um die globale Route und den Meteor-Effekt ueber mehrere Luefter und Cluster zu steuern.
+          um den Meteor-Effekt ueber mehrere Luefter und Cluster zu steuern.
         </p>
       </Panel>
     </main>

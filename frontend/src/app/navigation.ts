@@ -46,34 +46,6 @@ export const primaryNavigation: NavigationItem[] = [
     description: "Pair and manage wireless clusters in a two-tab workflow.",
     status: "ready",
   },
-  {
-    label: "Profiles",
-    to: "/profiles",
-    eyebrow: "presets",
-    description: "Create, manage, and apply lighting and fan presets.",
-    status: "ready",
-  },
-  {
-    label: "Diagnostics",
-    to: "/diagnostics",
-    eyebrow: "health",
-    description: "System status, daemon connectivity, and event stream health.",
-    status: "ready",
-  },
-  {
-    label: "Settings",
-    to: "/settings",
-    eyebrow: "settings",
-    description: "System configuration and links to active hardware tools.",
-    status: "ready",
-  },
-  {
-    label: "Help",
-    to: "/help",
-    eyebrow: "docs",
-    description: "Browse technical and functional project documentation.",
-    status: "ready",
-  },
 ];
 
 export function navigationItemForPath(pathname: string) {

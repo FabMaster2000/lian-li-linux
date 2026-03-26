@@ -7,12 +7,9 @@ import { useBackendEventSubscription } from "./useBackendEventSubscription";
 import { listDevices } from "../services/devices";
 import {
   applyLightingWorkbench,
-  getLightingEffectRoute,
   getLightingState,
-  saveLightingEffectRoute,
 } from "../services/lighting";
 import type {
-  LightingEffectRouteEntryDocument,
   LightingStateResponse,
 } from "../types/api";
 import {
@@ -26,84 +23,11 @@ import { isMvpRgbEffect } from "../features/lighting";
 
 export type RgbEffectChoice = "Static" | "Meteor";
 
-const METEOR_FIXED_SPEED = 10;
+const METEOR_DEFAULT_SPEED = 10;
 const METEOR_FIXED_BRIGHTNESS = 100;
 
 function toErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
-}
-
-export type RouteDraftEntry = {
-  key: string;
-  deviceId: string;
-  fanIndex: number;
-  label: string;
-};
-
-function routeEntryKey(deviceId: string, fanIndex: number) {
-  return `${deviceId}::${fanIndex}`;
-}
-
-function buildAllFansRoute(clusters: MvpCluster[]): RouteDraftEntry[] {
-  return clusters.flatMap((cluster) =>
-    cluster.devices.flatMap((device) => {
-      const fanCount = Math.max(0, device.capabilities.fan_count ?? 0);
-      return Array.from({ length: fanCount }, (_, index) => {
-        const fanIndex = index + 1;
-        const prefix =
-          device.display_name && device.display_name !== cluster.label
-            ? `${cluster.label} · ${device.display_name}`
-            : cluster.label;
-        return {
-          key: routeEntryKey(device.id, fanIndex),
-          deviceId: device.id,
-          fanIndex,
-          label: `${prefix} · Lüfter ${fanIndex}`,
-        };
-      });
-    }),
-  );
-}
-
-function applySavedOrder(
-  allFans: RouteDraftEntry[],
-  saved: LightingEffectRouteEntryDocument[],
-): RouteDraftEntry[] {
-  if (saved.length === 0) return allFans;
-
-  const fanMap = new Map(allFans.map((f) => [f.key, f]));
-  const ordered: RouteDraftEntry[] = [];
-
-  for (const entry of saved) {
-    const key = routeEntryKey(entry.device_id, entry.fan_index);
-    const fan = fanMap.get(key);
-    if (fan) {
-      ordered.push(fan);
-      fanMap.delete(key);
-    }
-  }
-
-  // Append any new fans that weren't in the saved route
-  for (const fan of fanMap.values()) {
-    ordered.push(fan);
-  }
-
-  return ordered;
-}
-
-function moveEntry(entries: RouteDraftEntry[], sourceKey: string, targetKey: string) {
-  const sourceIndex = entries.findIndex((e) => e.key === sourceKey);
-  const targetIndex = entries.findIndex((e) => e.key === targetKey);
-  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return entries;
-  const next = [...entries];
-  const [moved] = next.splice(sourceIndex, 1);
-  next.splice(targetIndex, 0, moved);
-  return next;
-}
-
-function routeOrderEqual(a: RouteDraftEntry[], b: RouteDraftEntry[]) {
-  if (a.length !== b.length) return false;
-  return a.every((entry, i) => entry.key === b[i]?.key);
 }
 
 export function useMvpRgbPageData(
@@ -124,20 +48,15 @@ export function useMvpRgbPageData(
   const [baselineEffect, setBaselineEffect] = useState<RgbEffectChoice>("Meteor");
   const [color, setColor] = useState("#5ec7ff");
   const [baselineColor, setBaselineColor] = useState("#5ec7ff");
-  const [routeDraft, setRouteDraft] = useState<RouteDraftEntry[]>([]);
-  const [baselineRoute, setBaselineRoute] = useState<RouteDraftEntry[]>([]);
+  const [speed, setSpeed] = useState(METEOR_DEFAULT_SPEED);
+  const [baselineSpeed, setBaselineSpeed] = useState(METEOR_DEFAULT_SPEED);
 
   const selectedCluster = useMemo(
     () => clusters.find((cluster) => cluster.id === selectedClusterId) ?? null,
     [clusters, selectedClusterId],
   );
 
-  const routeDirty = !routeOrderEqual(routeDraft, baselineRoute);
-  const dirty = color !== baselineColor || effect !== baselineEffect || routeDirty;
-
-  const reorderRouteEntry = useCallback((sourceKey: string, targetKey: string) => {
-    setRouteDraft((current) => moveEntry(current, sourceKey, targetKey));
-  }, []);
+  const dirty = color !== baselineColor || effect !== baselineEffect || speed !== baselineSpeed;
 
   const loadClusterState = useCallback(
     async (
@@ -157,22 +76,27 @@ export function useMvpRgbPageData(
         const nextColor = nextLightingState.zones[0]?.colors[0] ?? "#5ec7ff";
         const liveEffect = nextLightingState.zones[0]?.effect ?? "Meteor";
         const nextEffect: RgbEffectChoice = isMvpRgbEffect(liveEffect) ? (liveEffect as RgbEffectChoice) : "Static";
+        const nextSpeed = nextLightingState.zones[0]?.speed ?? METEOR_DEFAULT_SPEED;
 
         setLightingState(nextLightingState);
         setBaselineColor(nextColor);
         setBaselineEffect(nextEffect);
+        setBaselineSpeed(nextSpeed);
         if (syncDraft) {
           setColor(nextColor);
           setEffect(nextEffect);
+          setSpeed(nextSpeed);
         }
       } catch (nextError) {
         if (!background) {
           setLightingState(null);
           setBaselineColor("#5ec7ff");
           setBaselineEffect("Meteor");
+          setBaselineSpeed(METEOR_DEFAULT_SPEED);
           if (syncDraft) {
             setColor("#5ec7ff");
             setEffect("Meteor");
+            setSpeed(METEOR_DEFAULT_SPEED);
           }
         }
         setError(toErrorMessage(nextError, "RGB status could not be loaded"));
@@ -191,12 +115,10 @@ export function useMvpRgbPageData(
     async (options: {
       background?: boolean;
       preserveDraft?: boolean;
-      preserveRouteDraft?: boolean;
     } = {}) => {
       const {
         background = false,
         preserveDraft = dirty,
-        preserveRouteDraft = routeDirty,
       } = options;
 
       setError(null);
@@ -208,19 +130,10 @@ export function useMvpRgbPageData(
       }
 
       try {
-        const [devices, savedRoute] = await Promise.all([
-          listDevices(),
-          getLightingEffectRoute(),
-        ]);
+        const devices = await listDevices();
         const nextClusters = buildPairedClusters(devices);
-        const allFans = buildAllFansRoute(nextClusters);
-        const orderedRoute = applySavedOrder(allFans, savedRoute.route);
 
         setClusters(nextClusters);
-        setBaselineRoute(orderedRoute);
-        if (!preserveRouteDraft) {
-          setRouteDraft(orderedRoute);
-        }
 
         const resolvedClusterId =
           resolveRequestedClusterId(requestedClusterId, requestedDeviceId, nextClusters) ||
@@ -235,9 +148,11 @@ export function useMvpRgbPageData(
           setLightingState(null);
           setBaselineColor("#5ec7ff");
           setBaselineEffect("Meteor");
+          setBaselineSpeed(METEOR_DEFAULT_SPEED);
           if (!preserveDraft) {
             setColor("#5ec7ff");
             setEffect("Meteor");
+            setSpeed(METEOR_DEFAULT_SPEED);
           }
           return;
         }
@@ -264,7 +179,6 @@ export function useMvpRgbPageData(
     },
     [
       dirty,
-      routeDirty,
       loadClusterState,
       requestedClusterId,
       requestedDeviceId,
@@ -273,7 +187,7 @@ export function useMvpRgbPageData(
   );
 
   useEffect(() => {
-    void refresh({ preserveDraft: false, preserveRouteDraft: false });
+    void refresh({ preserveDraft: false });
   }, [requestedClusterId, requestedDeviceId]);
 
   useBackendEventSubscription(
@@ -286,7 +200,7 @@ export function useMvpRgbPageData(
           event.type === "lighting.changed" ||
           event.type === "config.changed"
         ) {
-          void refresh({ background: true, preserveDraft: true, preserveRouteDraft: true });
+          void refresh({ background: true, preserveDraft: true });
         }
       },
       [refresh],
@@ -295,7 +209,7 @@ export function useMvpRgbPageData(
 
   useBackgroundRefresh(
     useCallback(async () => {
-      await refresh({ background: true, preserveDraft: true, preserveRouteDraft: true });
+      await refresh({ background: true, preserveDraft: true });
     }, [refresh]),
     LIVE_STATUS_REFRESH_INTERVAL_MS,
   );
@@ -322,21 +236,13 @@ export function useMvpRgbPageData(
 
       try {
         if (effect === "Meteor") {
-          // Save the route order first, then apply Meteor
-          await saveLightingEffectRoute({
-            route: routeDraft.map((entry) => ({
-              device_id: entry.deviceId,
-              fan_index: entry.fanIndex,
-            })),
-          });
-
           await applyLightingWorkbench({
             target_mode: "route",
             device_ids: [],
             zone_mode: "all_zones",
             effect: "Meteor",
             brightness: METEOR_FIXED_BRIGHTNESS,
-            speed: METEOR_FIXED_SPEED,
+            speed,
             colors: [{ hex: color }],
             scope: "All",
             sync_selected: false,
@@ -357,7 +263,7 @@ export function useMvpRgbPageData(
           });
         }
 
-        await refresh({ preserveDraft: false, preserveRouteDraft: false });
+        await refresh({ preserveDraft: false });
         setSuccess(
           effect === "Meteor"
             ? "Meteor-Effekt wurde auf alle Lüfter angewendet."
@@ -373,16 +279,16 @@ export function useMvpRgbPageData(
         setApplying(false);
       }
     },
-    [clusters, color, effect, lightingState, refresh, routeDraft, selectedCluster],
+    [clusters, color, effect, lightingState, refresh, selectedCluster],
   );
 
   const resetDraft = useCallback(() => {
     setColor(baselineColor);
     setEffect(baselineEffect);
-    setRouteDraft(baselineRoute);
+    setSpeed(baselineSpeed);
     setError(null);
     setSuccess(null);
-  }, [baselineColor, baselineEffect, baselineRoute]);
+  }, [baselineColor, baselineEffect, baselineSpeed]);
 
   return {
     clusters,
@@ -401,12 +307,12 @@ export function useMvpRgbPageData(
     setEffect,
     color,
     setColor,
-    routeDraft,
-    reorderRouteEntry,
+    speed,
+    setSpeed,
     dirty,
     rgbSummary: summarizeLightingState(lightingState),
     refresh: async () => {
-      await refresh({ preserveDraft: true, preserveRouteDraft: true });
+      await refresh({ preserveDraft: true });
     },
     applyChanges,
     resetDraft,

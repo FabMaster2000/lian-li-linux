@@ -5,8 +5,6 @@ import type {
   LightingBrightnessRequest,
   LightingColorRequest,
   LightingEffectRequest,
-  LightingEffectRouteResponse,
-  LightingEffectRouteSaveRequest,
   LightingStateResponse,
 } from "../types/api";
 
@@ -55,13 +53,4 @@ export function applyLightingWorkbench(request: LightingApplyRequest) {
   );
 }
 
-export function getLightingEffectRoute() {
-  return apiClient.get<LightingEffectRouteResponse>("/lighting/effect-route");
-}
 
-export function saveLightingEffectRoute(request: LightingEffectRouteSaveRequest) {
-  return apiClient.put<LightingEffectRouteResponse, LightingEffectRouteSaveRequest>(
-    "/lighting/effect-route",
-    request,
-  );
-}

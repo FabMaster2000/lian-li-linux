@@ -926,28 +926,28 @@ impl RgbController {
                     .get_mut(device_id)
                     .expect("wireless state checked above");
 
-                // SL-INF Meteor: the plan covers *all* fans/zones at once.
+                // SL-INF: all effects use full-device rendering.
                 // Set all zone_sources to the effect and send only once,
                 // rather than rebuilding + re-sending for each of the 5 zones.
-                if state.fan_type == WirelessFanType::SlInf && effect.mode == RgbMode::Meteor {
+                if state.fan_type == WirelessFanType::SlInf {
                     let already_applied = state.zone_sources.iter().all(|src| {
                         matches!(src, WirelessZoneSource::Effect(e) if *e == *effect)
                     });
                     if already_applied {
-                        // All zones already set to the exact same Meteor effect — skip redundant RF send
                         debug!(
-                            "Skipped redundant Meteor send for {device_id} zone {zone}"
+                            "Skipped redundant send for {device_id} zone {zone}: {:?}",
+                            effect.mode
                         );
                         return Ok(());
                     }
-                    // First zone to request Meteor: set ALL zones and send once
+                    // First zone to request this effect: set ALL zones and send once
                     for zs in state.zone_sources.iter_mut() {
                         *zs = WirelessZoneSource::Effect(effect.clone());
                     }
                     let plan = rebuild_wireless_render_plan(state)?;
                     send_wireless_render_plan(wireless, state, plan, 4)?;
                     debug!(
-                        "Set wireless RGB (full Meteor) on {device_id}: {:?}, {} cluster LEDs",
+                        "Set wireless RGB (full) on {device_id}: {:?}, {} cluster LEDs",
                         effect.mode, cluster_led_count
                     );
                     return Ok(());
@@ -1660,6 +1660,12 @@ const ANIMATED_SEND_PASSES: u8 = 3;
 /// Delay between animated send passes (ms).  Matches L-Connect's ~500ms
 /// round-robin cycle period.
 const ANIMATED_SEND_PASS_DELAY_MS: u64 = 500;
+/// Number of times to send static (non-animated) effect data.
+/// RF packet loss can cause a device to miss the single send; 2 passes
+/// with a short gap dramatically improve reliability.
+const STATIC_SEND_PASSES: u8 = 2;
+/// Delay between static send passes (ms).
+const STATIC_SEND_PASS_DELAY_MS: u64 = 150;
 
 fn send_wireless_render_plan(
     wireless: &WirelessController,
@@ -1683,15 +1689,22 @@ fn send_wireless_render_plan(
             }
         }
     } else {
-        state.effect_counter = state.effect_counter.wrapping_add(1);
-        let idx = state.effect_counter.to_be_bytes();
         let frame = plan
             .frames
             .into_iter()
             .next()
             .unwrap_or_else(|| vec![[0, 0, 0]; state.led_state.len()]);
         state.led_state = frame.clone();
-        wireless.send_rgb_direct(&state.mac, &frame, &idx, header_repeats)?;
+        for pass in 0..STATIC_SEND_PASSES {
+            state.effect_counter = state.effect_counter.wrapping_add(1);
+            let idx = state.effect_counter.to_be_bytes();
+            wireless.send_rgb_direct(&state.mac, &frame, &idx, header_repeats)?;
+            if pass < STATIC_SEND_PASSES - 1 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    STATIC_SEND_PASS_DELAY_MS,
+                ));
+            }
+        }
     }
 
     Ok(())
