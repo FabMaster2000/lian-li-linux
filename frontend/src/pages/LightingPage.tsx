@@ -184,6 +184,7 @@ export function LightingPage() {
               >
                 <option value="Static">Statisch</option>
                 <option value="Meteor">Meteor</option>
+                <option value="Runway">Runway</option>
               </select>
             </label>
             <ColorField
@@ -192,7 +193,7 @@ export function LightingPage() {
               onChange={setColor}
               value={color}
             />
-            {effect === "Meteor" ? (
+            {effect !== "Static" ? (
               <SliderField
                 disabled={!selectedCluster || applyDisabled}
                 label="Geschwindigkeit"
@@ -220,7 +221,7 @@ export function LightingPage() {
             >
               {applying ? "Speichere..." : "Übernehmen"}
             </button>
-            {effect !== "Meteor" ? (
+            {effect === "Static" ? (
               <button
                 className="button-link"
                 disabled={applyDisabled || clusters.length === 0}

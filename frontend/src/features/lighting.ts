@@ -30,19 +30,21 @@ export type LightingPreset = {
 
 const effectOptions: LightingEffectOption[] = [
   { value: "Meteor", label: "Meteor" },
+  { value: "Runway", label: "Runway" },
 ];
 
 const noPaletteEffects = new Set<string>();
 const multiPaletteEffects = new Set<string>();
 const noSpeedEffects = new Set<string>();
-const directionalEffects = new Set(["Meteor"]);
-const scopedEffects = new Set(["Meteor"]);
+const directionalEffects = new Set(["Meteor", "Runway"]);
+const scopedEffects = new Set(["Meteor", "Runway"]);
 const pumpOnlyEffects = new Set<string>();
 
 export const lightingEffectOptions = effectOptions;
 
 export const mvpRgbEffectValues = [
   "Meteor",
+  "Runway",
 ] as const;
 
 const mvpRgbEffectValueSet = new Set<string>(mvpRgbEffectValues);
@@ -79,6 +81,17 @@ export const lightingPresetCatalog: LightingPreset[] = [
     description: "Meteor trail animation across all fans.",
     effect: "Meteor",
     colors: ["#ff3b30"],
+    brightness: 85,
+    speed: 3,
+    direction: "Clockwise",
+    scope: "All",
+  },
+  {
+    id: "runway-default",
+    label: "Runway",
+    description: "Sharp fan-by-fan sweep across all fans.",
+    effect: "Runway",
+    colors: ["#5ec7ff"],
     brightness: 85,
     speed: 3,
     direction: "Clockwise",

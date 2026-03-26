@@ -21,7 +21,7 @@ import {
 } from "../features/mvpClusters";
 import { isMvpRgbEffect } from "../features/lighting";
 
-export type RgbEffectChoice = "Static" | "Meteor";
+export type RgbEffectChoice = "Static" | "Meteor" | "Runway";
 
 const METEOR_DEFAULT_SPEED = 10;
 const METEOR_FIXED_BRIGHTNESS = 100;
@@ -235,12 +235,12 @@ export function useMvpRgbPageData(
       setSuccess(null);
 
       try {
-        if (effect === "Meteor") {
+        if (effect === "Meteor" || effect === "Runway") {
           await applyLightingWorkbench({
             target_mode: "route",
             device_ids: [],
             zone_mode: "all_zones",
-            effect: "Meteor",
+            effect: effect,
             brightness: METEOR_FIXED_BRIGHTNESS,
             speed,
             colors: [{ hex: color }],
@@ -265,8 +265,8 @@ export function useMvpRgbPageData(
 
         await refresh({ preserveDraft: false });
         setSuccess(
-          effect === "Meteor"
-            ? "Meteor-Effekt wurde auf alle Lüfter angewendet."
+          effect === "Meteor" || effect === "Runway"
+            ? `${effect}-Effekt wurde auf alle Lüfter angewendet.`
             : applyToAll
               ? "RGB-Einstellung wurde auf alle Cluster übertragen."
               : "RGB-Einstellung wurde erfolgreich gespeichert.",

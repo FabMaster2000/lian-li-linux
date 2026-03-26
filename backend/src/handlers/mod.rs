@@ -526,7 +526,7 @@ pub async fn apply_lighting_workbench(
     if let Some(speed) = body.speed {
         validate_lighting_speed(speed)?;
     }
-    if mode != RgbMode::Meteor {
+    if mode != RgbMode::Meteor && mode != RgbMode::Runway {
         if let Some(smoothness_ms) = body.smoothness_ms {
             validate_lighting_smoothness(smoothness_ms)?;
         }
@@ -579,7 +579,7 @@ pub async fn apply_lighting_workbench(
             if !palette.is_empty() {
                 effect.colors = palette.clone();
             }
-            if mode == RgbMode::Meteor {
+            if mode == RgbMode::Meteor || mode == RgbMode::Runway {
                 effect.brightness = percent_to_brightness(METEOR_FIXED_BRIGHTNESS_PERCENT);
                 effect.smoothness_ms = METEOR_FIXED_SMOOTHNESS_MS;
                 effect.direction = METEOR_FIXED_DIRECTION;
@@ -589,7 +589,7 @@ pub async fn apply_lighting_workbench(
             if let Some(speed) = body.speed {
                 effect.speed = speed;
             }
-            if mode != RgbMode::Meteor {
+            if mode != RgbMode::Meteor && mode != RgbMode::Runway {
                 if let Some(direction) = &body.direction {
                     effect.direction = parse_direction(direction)?;
                 }
@@ -597,7 +597,7 @@ pub async fn apply_lighting_workbench(
             if let Some(scope) = &body.scope {
                 effect.scope = parse_scope(scope)?;
             }
-            if mode != RgbMode::Meteor {
+            if mode != RgbMode::Meteor && mode != RgbMode::Runway {
                 if let Some(smoothness_ms) = body.smoothness_ms {
                     effect.smoothness_ms = smoothness_ms;
                 }

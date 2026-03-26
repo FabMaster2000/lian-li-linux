@@ -60,6 +60,10 @@ struct RouteLedSegment {
     device_id: String,
     fan_slot_index: usize,
     led_indexes: Vec<usize>,
+    /// Round-robin offset for each LED (same offset = same angular position).
+    led_offsets: Vec<usize>,
+    /// Maximum offset (= max zone length) — used for row calculations.
+    max_offset: usize,
 }
 
 struct WirelessRenderPlan {
@@ -282,7 +286,7 @@ fn wireless_supported_modes(fan_type: WirelessFanType) -> Vec<RgbMode> {
 }
 
 fn effect_is_route_aware(mode: RgbMode) -> bool {
-    matches!(mode, RgbMode::Wave | RgbMode::TailChasing | RgbMode::Meteor)
+    matches!(mode, RgbMode::Wave | RgbMode::TailChasing | RgbMode::Meteor | RgbMode::Runway)
 }
 
 fn effect_is_animated(mode: RgbMode) -> bool {
@@ -311,14 +315,18 @@ fn configured_route_segments(
             }
 
             let fan_slot_index = entry.fan_index.checked_sub(1)? as usize;
-            let led_indexes = if full_fan_traversal {
-                slinf_full_fan_traversal_indexes(state, fan_slot_index)
+            let (led_indexes, led_offsets, max_offset) = if full_fan_traversal {
+                let (indexes, offsets, max_off) =
+                    slinf_full_fan_traversal_indexes(state, fan_slot_index);
+                (indexes, offsets, max_off)
             } else {
                 let zone = state
                     .slinf_zone_layouts
                     .get(fan_slot_index)
                     .and_then(|fan_layout| fan_layout.get(zone_idx))?;
-                zone.led_indexes.clone()
+                let count = zone.led_indexes.len();
+                let offsets: Vec<usize> = (0..count).collect();
+                (zone.led_indexes.clone(), offsets, count)
             };
 
             if led_indexes.is_empty() {
@@ -329,14 +337,19 @@ fn configured_route_segments(
                 device_id: entry.device_id.clone(),
                 fan_slot_index,
                 led_indexes,
+                led_offsets,
+                max_offset,
             })
         })
         .collect()
 }
 
-fn slinf_full_fan_traversal_indexes(state: &WirelessRgbState, fan_slot_index: usize) -> Vec<usize> {
+fn slinf_full_fan_traversal_indexes(
+    state: &WirelessRgbState,
+    fan_slot_index: usize,
+) -> (Vec<usize>, Vec<usize>, usize) {
     let Some(fan_layout) = state.slinf_zone_layouts.get(fan_slot_index) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), 0);
     };
 
     let max_zone_len = fan_layout
@@ -346,15 +359,17 @@ fn slinf_full_fan_traversal_indexes(state: &WirelessRgbState, fan_slot_index: us
         .unwrap_or(0);
 
     let mut ordered = Vec::new();
+    let mut offsets = Vec::new();
     for led_offset in 0..max_zone_len {
         for zone in fan_layout {
             if let Some(led_index) = zone.led_indexes.get(led_offset) {
                 ordered.push(*led_index);
+                offsets.push(led_offset);
             }
         }
     }
 
-    ordered
+    (ordered, offsets, max_zone_len)
 }
 
 fn build_wireless_route_render_plans(
@@ -363,7 +378,7 @@ fn build_wireless_route_render_plans(
     zone_idx: usize,
     effect: &RgbEffect,
 ) -> HashMap<String, WirelessRenderPlan> {
-    let full_fan_traversal = effect.mode == RgbMode::Meteor;
+    let full_fan_traversal = effect.mode == RgbMode::Meteor || effect.mode == RgbMode::Runway;
     let segments = configured_route_segments(
         wireless_state,
         effect_route,
@@ -382,7 +397,7 @@ fn build_wireless_route_render_plans(
     };
     let animated = frame_count > 1;
 
-    let interval_ms = if effect.mode == RgbMode::Meteor || effect.mode == RgbMode::MeteorShower {
+    let interval_ms = if matches!(effect.mode, RgbMode::Meteor | RgbMode::MeteorShower | RgbMode::Runway) {
         meteor_interval_ms(effect.speed)
     } else {
         WIRELESS_EFFECT_INTERVAL_MS
@@ -402,50 +417,56 @@ fn build_wireless_route_render_plans(
             });
     }
 
-    if effect.mode == RgbMode::Meteor {
-        // Cross-cluster Meteor sweep: the trail travels across all fans in
-        // route order, identical to L-Connect's merging behaviour.
+    if effect.mode == RgbMode::Meteor || effect.mode == RgbMode::Runway {
+        // Cross-cluster sweep: the trail travels across all fans in route
+        // order, crossing device boundaries.
+        //
+        // Runway: all LEDs in a fan share the same row → fan-by-fan sweep.
+        // Meteor: each LED gets a fractional row based on its round-robin
+        //         offset within the fan → within-fan trail.
         let palette = palette_from_effect(effect);
         let color = palette[0];
         let trail_len = METEOR_TRAIL_TABLE.len();
         let reversed = effect.direction == RgbDirection::CounterClockwise;
+        let is_runway = effect.mode == RgbMode::Runway;
 
-        // Build per-LED entries with a *global* row offset that spans every
-        // fan in the route, so the sweep crosses device boundaries.
         struct LedEntry {
             device_id: String,
             dst_index: usize,
-            global_row: usize,
+            global_row_frac: f32,
         }
         let mut led_entries: Vec<LedEntry> = Vec::new();
-        let mut global_fan_idx: usize = 0; // sequential position in route
+        let mut global_fan_idx: usize = 0;
 
         for segment in &segments {
             let Some(state) = wireless_state.get(&segment.device_id) else {
                 global_fan_idx += 1;
                 continue;
             };
-            let fan_row_offset = global_fan_idx * METEOR_ROWS_PER_FAN;
-            let fan_led_count = segment.led_indexes.len();
+            let fan_row_offset = (global_fan_idx * METEOR_ROWS_PER_FAN) as f32;
             let fan_base = segment.fan_slot_index * state.leds_per_fan as usize;
 
-            for (t_idx, &led_index) in segment.led_indexes.iter().enumerate() {
-                let local_row = if fan_led_count > 0 {
-                    t_idx * METEOR_ROWS_PER_FAN / fan_led_count
+            for (i, &led_index) in segment.led_indexes.iter().enumerate() {
+                let global_row_frac = if is_runway {
+                    // Runway: entire fan ring lights as one unit.
+                    fan_row_offset
                 } else {
-                    0
+                    // Meteor: within-fan trail using round-robin offset.
+                    let offset = segment.led_offsets[i] as f32;
+                    let max_off = segment.max_offset.max(1) as f32;
+                    fan_row_offset + (offset / max_off) * METEOR_ROWS_PER_FAN as f32
                 };
                 led_entries.push(LedEntry {
                     device_id: segment.device_id.clone(),
                     dst_index: fan_base + led_index,
-                    global_row: fan_row_offset + local_row,
+                    global_row_frac,
                 });
             }
             global_fan_idx += 1;
         }
 
         let total_rows = global_fan_idx * METEOR_ROWS_PER_FAN;
-        let active_frames = (total_rows + trail_len - 1).min(frame_count);
+        let active_frames = (total_rows + trail_len).min(frame_count);
         let start_offset = if reversed { frame_count.saturating_sub(active_frames) } else { 0 };
 
         for step in 0..active_frames {
@@ -458,14 +479,23 @@ fn build_wireless_route_render_plans(
 
             for entry in &led_entries {
                 let distance = if reversed {
-                    entry.global_row as isize - head_row as isize
+                    entry.global_row_frac - head_row as f32
                 } else {
-                    head_row as isize - entry.global_row as isize
+                    head_row as f32 - entry.global_row_frac
                 };
-                if distance < 0 || distance >= trail_len as isize {
+                if distance < 0.0 || distance >= trail_len as f32 {
                     continue;
                 }
-                let intensity = METEOR_TRAIL_TABLE[distance as usize];
+                let intensity = if distance >= (trail_len - 1) as f32 {
+                    let frac = distance - (trail_len - 1) as f32;
+                    METEOR_TRAIL_TABLE[trail_len - 1] * (1.0 - frac)
+                } else {
+                    let idx_lo = distance.floor() as usize;
+                    let idx_hi = idx_lo + 1;
+                    let frac = distance - idx_lo as f32;
+                    METEOR_TRAIL_TABLE[idx_lo] * (1.0 - frac)
+                        + METEOR_TRAIL_TABLE[idx_hi] * frac
+                };
                 let Some(plan) = plans.get_mut(&entry.device_id) else {
                     continue;
                 };
@@ -569,23 +599,23 @@ fn speed_factor(speed: u8) -> f32 {
 
 const METEOR_FIXED_TRAIL_WIDTH: f32 = 0.525;
 
-/// L-Connect Meteor brightness lookup table (12 discrete steps).
-/// Derived from pixel-level analysis of L-Connect USB capture data.
-/// Each value is the intensity relative to the head brightness (1.0 = head).
-/// Index 0 = head (brightest), index 11 = tail tip (dimmest).
+/// Meteor brightness lookup table (12 discrete steps from L-Connect captures).
+/// Index 0 = head (brightest), 11 = tail tip (dimmest).
+/// Per-LED fractional positions are interpolated between entries so the
+/// trail fades smoothly even though the table only has 12 values.
 const METEOR_TRAIL_TABLE: [f32; 12] = [
     1.000, // head
-    0.749, // 134/179
-    0.497, // 89/179
-    0.369, // 66/179
-    0.246, // 44/179
-    0.179, // 32/179
-    0.151, // 27/179
-    0.117, // 21/179
-    0.084, // 15/179
-    0.073, // 13/179
-    0.056, // 10/179
-    0.039, // 7/179 - tail tip
+    0.749,
+    0.497,
+    0.369,
+    0.276,
+    0.212,
+    0.168,
+    0.134,
+    0.106,
+    0.084,
+    0.067,
+    0.052, // tail tip
 ];
 
 fn palette_from_effect(effect: &RgbEffect) -> Vec<[u8; 3]> {
@@ -926,28 +956,28 @@ impl RgbController {
                     .get_mut(device_id)
                     .expect("wireless state checked above");
 
-                // SL-INF: all effects use full-device rendering.
+                // SL-INF Meteor: the plan covers *all* fans/zones at once.
                 // Set all zone_sources to the effect and send only once,
                 // rather than rebuilding + re-sending for each of the 5 zones.
-                if state.fan_type == WirelessFanType::SlInf {
+                if state.fan_type == WirelessFanType::SlInf && effect.mode == RgbMode::Meteor {
                     let already_applied = state.zone_sources.iter().all(|src| {
                         matches!(src, WirelessZoneSource::Effect(e) if *e == *effect)
                     });
                     if already_applied {
+                        // All zones already set to the exact same Meteor effect — skip redundant RF send
                         debug!(
-                            "Skipped redundant send for {device_id} zone {zone}: {:?}",
-                            effect.mode
+                            "Skipped redundant Meteor send for {device_id} zone {zone}"
                         );
                         return Ok(());
                     }
-                    // First zone to request this effect: set ALL zones and send once
+                    // First zone to request Meteor: set ALL zones and send once
                     for zs in state.zone_sources.iter_mut() {
                         *zs = WirelessZoneSource::Effect(effect.clone());
                     }
                     let plan = rebuild_wireless_render_plan(state)?;
                     send_wireless_render_plan(wireless, state, plan, 4)?;
                     debug!(
-                        "Set wireless RGB (full) on {device_id}: {:?}, {} cluster LEDs",
+                        "Set wireless RGB (full Meteor) on {device_id}: {:?}, {} cluster LEDs",
                         effect.mode, cluster_led_count
                     );
                     return Ok(());
@@ -1489,9 +1519,11 @@ fn apply_wireless_zone_frame(
     }
 }
 
-/// Number of round-robin rows per SL-INF fan in the Meteor sweep.
-/// L-Connect packs 44 LEDs into 8 rows (zones with 10 LEDs contribute
-/// 2 LEDs in certain rows, zones with 8 LEDs contribute exactly 1).
+/// Number of discrete round-robin rows per SL-INF fan in the Meteor sweep.
+/// The head advances one row per frame.  Per-LED positions are stored as
+/// fractional row values and the trail-table lookup uses linear
+/// interpolation, so every LED gets an individually-computed brightness
+/// even though there are only 8 integer rows (~5–6 LEDs each).
 const METEOR_ROWS_PER_FAN: usize = 8;
 
 /// Renders a Meteor effect for a SL-INF device using the L-Connect algorithm.
@@ -1516,31 +1548,25 @@ fn rebuild_slinf_full_fan_meteor_plan(
     let fan_count = state.fan_count as usize;
     let leds_per_fan = state.leds_per_fan as usize;
 
-    // Build per-fan rows. Each fan is an independent 8-row unit (no cross-fan
-    // mixing). Fans are traversed in forward order (fan 0 → fan N-1), matching
-    // L-Connect's 3-fan capture where the sweep goes from low buffer indices
-    // to high.
+    // Meteor: each LED gets a fractional row based on its round-robin offset
+    // within the fan, creating a within-fan trail sweep.
     struct LedEntry {
-        global_row: usize,
+        global_row_frac: f32,
         dst_index: usize,
     }
     let mut led_entries: Vec<LedEntry> = Vec::with_capacity(total_leds);
 
     for fan_slot_index in 0..fan_count {
-        let traversal = slinf_full_fan_traversal_indexes(state, fan_slot_index);
+        let (traversal, offsets, max_offset) =
+            slinf_full_fan_traversal_indexes(state, fan_slot_index);
         let fan_base = fan_slot_index * leds_per_fan;
-        let fan_row_offset = fan_slot_index * METEOR_ROWS_PER_FAN;
-        let fan_led_count = traversal.len();
+        let fan_row_offset = (fan_slot_index * METEOR_ROWS_PER_FAN) as f32;
+        let max_off = max_offset.max(1) as f32;
 
-        for (t_idx, &led_index) in traversal.iter().enumerate() {
-            // Distribute LEDs evenly into METEOR_ROWS_PER_FAN rows.
-            let local_row = if fan_led_count > 0 {
-                t_idx * METEOR_ROWS_PER_FAN / fan_led_count
-            } else {
-                0
-            };
+        for (i, &led_index) in traversal.iter().enumerate() {
+            let offset = offsets[i] as f32;
             led_entries.push(LedEntry {
-                global_row: fan_row_offset + local_row,
+                global_row_frac: fan_row_offset + (offset / max_off) * METEOR_ROWS_PER_FAN as f32,
                 dst_index: fan_base + led_index,
             });
         }
@@ -1555,15 +1581,15 @@ fn rebuild_slinf_full_fan_meteor_plan(
     }
 
     let total_rows = fan_count * METEOR_ROWS_PER_FAN;
-    let trail_len = METEOR_TRAIL_TABLE.len(); // 12
+    let trail_len = METEOR_TRAIL_TABLE.len();
     let reversed = effect.direction == RgbDirection::CounterClockwise;
 
-    // Active phase: head crosses total_rows, then trail_len-1 more frames for
-    // the trail to fully fade. Dark phase fills the remaining frames.
+    // Active phase: head crosses total_rows, then trail_len more frames for
+    // the trail to fully fade (including the fade-to-zero tail tip).
     // Forward: active at start (frames 0..active_frames).
     // Reversed: active at end (frames start_offset..start_offset+active_frames),
     //           matching L-Connect captures.
-    let active_frames = (total_rows + trail_len - 1).min(frame_count);
+    let active_frames = (total_rows + trail_len).min(frame_count);
     let start_offset = if reversed { frame_count.saturating_sub(active_frames) } else { 0 };
 
     let mut frames = vec![vec![[0u8, 0, 0]; total_leds]; frame_count];
@@ -1578,18 +1604,124 @@ fn rebuild_slinf_full_fan_meteor_plan(
         };
 
         for entry in &led_entries {
-            // Distance from head: positive means the trail is behind the head.
+            // Fractional distance from head — enables sub-row interpolation.
             let distance = if reversed {
-                entry.global_row as isize - head_row as isize
+                entry.global_row_frac - head_row as f32
             } else {
-                head_row as isize - entry.global_row as isize
+                head_row as f32 - entry.global_row_frac
             };
 
-            if distance < 0 || distance >= trail_len as isize {
+            if distance < 0.0 || distance >= trail_len as f32 {
                 continue; // Not yet lit, or already faded
             }
 
-            let intensity = METEOR_TRAIL_TABLE[distance as usize];
+            // Tail tip: the last entry fades from TRAIL[last] to 0
+            // so LEDs don't all vanish at once.
+            let intensity = if distance >= (trail_len - 1) as f32 {
+                let frac = distance - (trail_len - 1) as f32;
+                METEOR_TRAIL_TABLE[trail_len - 1] * (1.0 - frac)
+            } else {
+                let idx_lo = distance.floor() as usize;
+                let idx_hi = idx_lo + 1;
+                let frac = distance - idx_lo as f32;
+                METEOR_TRAIL_TABLE[idx_lo] * (1.0 - frac)
+                    + METEOR_TRAIL_TABLE[idx_hi] * frac
+            };
+            if entry.dst_index < total_leds {
+                frames[frame_idx][entry.dst_index] = scale_color(color, intensity);
+            }
+        }
+    }
+
+    if let Some(last_frame) = frames.last().cloned() {
+        state.led_state = last_frame;
+    }
+
+    Ok(WirelessRenderPlan { frames, animated: true, interval_ms: meteor_interval_ms(effect.speed) })
+}
+
+/// Renders a Runway effect for a SL-INF device.
+///
+/// Runway is the fan-by-fan variant: every LED within a fan shares the same
+/// brightness, so the entire ring lights as one unit and the sweep moves
+/// fan-to-fan.
+fn rebuild_slinf_full_fan_runway_plan(
+    state: &mut WirelessRgbState,
+    effect: &RgbEffect,
+) -> anyhow::Result<WirelessRenderPlan> {
+    let frame_count = WIRELESS_EFFECT_FRAMES;
+    let total_leds = state.led_state.len();
+    let palette = palette_from_effect(effect);
+    let color = palette[0];
+    let fan_count = state.fan_count as usize;
+    let leds_per_fan = state.leds_per_fan as usize;
+
+    struct LedEntry {
+        global_row_frac: f32,
+        dst_index: usize,
+    }
+    let mut led_entries: Vec<LedEntry> = Vec::with_capacity(total_leds);
+
+    for fan_slot_index in 0..fan_count {
+        let (traversal, _offsets, _max_offset) =
+            slinf_full_fan_traversal_indexes(state, fan_slot_index);
+        let fan_base = fan_slot_index * leds_per_fan;
+        let fan_row_offset = (fan_slot_index * METEOR_ROWS_PER_FAN) as f32;
+
+        for (_, &led_index) in traversal.iter().enumerate() {
+            led_entries.push(LedEntry {
+                global_row_frac: fan_row_offset,
+                dst_index: fan_base + led_index,
+            });
+        }
+    }
+
+    if led_entries.is_empty() {
+        return Ok(WirelessRenderPlan {
+            frames: vec![vec![[0u8, 0, 0]; total_leds]; frame_count],
+            animated: false,
+            interval_ms: meteor_interval_ms(effect.speed),
+        });
+    }
+
+    let total_rows = fan_count * METEOR_ROWS_PER_FAN;
+    let trail_len = METEOR_TRAIL_TABLE.len();
+    let reversed = effect.direction == RgbDirection::CounterClockwise;
+
+    let active_frames = (total_rows + trail_len).min(frame_count);
+    let start_offset = if reversed { frame_count.saturating_sub(active_frames) } else { 0 };
+
+    let mut frames = vec![vec![[0u8, 0, 0]; total_leds]; frame_count];
+
+    for step in 0..active_frames {
+        let frame_idx = start_offset + step;
+        let head_row = if reversed {
+            total_rows.saturating_sub(1).saturating_sub(step.min(total_rows.saturating_sub(1)))
+        } else {
+            step
+        };
+
+        for entry in &led_entries {
+            let distance = if reversed {
+                entry.global_row_frac - head_row as f32
+            } else {
+                head_row as f32 - entry.global_row_frac
+            };
+
+            if distance < 0.0 || distance >= trail_len as f32 {
+                continue;
+            }
+
+            let intensity = if distance >= (trail_len - 1) as f32 {
+                let frac = distance - (trail_len - 1) as f32;
+                METEOR_TRAIL_TABLE[trail_len - 1] * (1.0 - frac)
+            } else {
+                let idx_lo = distance.floor() as usize;
+                let idx_hi = idx_lo + 1;
+                let frac = distance - idx_lo as f32;
+                METEOR_TRAIL_TABLE[idx_lo] * (1.0 - frac)
+                    + METEOR_TRAIL_TABLE[idx_hi] * frac
+            };
             if entry.dst_index < total_leds {
                 frames[frame_idx][entry.dst_index] = scale_color(color, intensity);
             }
@@ -1604,17 +1736,25 @@ fn rebuild_slinf_full_fan_meteor_plan(
 }
 
 fn rebuild_wireless_render_plan(state: &mut WirelessRgbState) -> anyhow::Result<WirelessRenderPlan> {
-    // SL-INF Meteor: use full-fan traversal so the animation sweeps all 44 LEDs
-    // of each fan as one continuous ring rather than 5 independent zone meteors.
+    // SL-INF Meteor/Runway: use full-fan traversal so the animation sweeps
+    // all 44 LEDs of each fan as one continuous ring.
     if state.fan_type == WirelessFanType::SlInf {
-        if let Some(meteor_effect) = state.zone_sources.iter().find_map(|src| {
+        if let Some(effect) = state.zone_sources.iter().find_map(|src| {
             if let WirelessZoneSource::Effect(e) = src {
-                if e.mode == RgbMode::Meteor { Some(e.clone()) } else { None }
+                if e.mode == RgbMode::Meteor || e.mode == RgbMode::Runway {
+                    Some(e.clone())
+                } else {
+                    None
+                }
             } else {
                 None
             }
         }) {
-            return rebuild_slinf_full_fan_meteor_plan(state, &meteor_effect);
+            return if effect.mode == RgbMode::Runway {
+                rebuild_slinf_full_fan_runway_plan(state, &effect)
+            } else {
+                rebuild_slinf_full_fan_meteor_plan(state, &effect)
+            };
         }
     }
 
@@ -1660,12 +1800,6 @@ const ANIMATED_SEND_PASSES: u8 = 3;
 /// Delay between animated send passes (ms).  Matches L-Connect's ~500ms
 /// round-robin cycle period.
 const ANIMATED_SEND_PASS_DELAY_MS: u64 = 500;
-/// Number of times to send static (non-animated) effect data.
-/// RF packet loss can cause a device to miss the single send; 2 passes
-/// with a short gap dramatically improve reliability.
-const STATIC_SEND_PASSES: u8 = 2;
-/// Delay between static send passes (ms).
-const STATIC_SEND_PASS_DELAY_MS: u64 = 150;
 
 fn send_wireless_render_plan(
     wireless: &WirelessController,
@@ -1689,22 +1823,15 @@ fn send_wireless_render_plan(
             }
         }
     } else {
+        state.effect_counter = state.effect_counter.wrapping_add(1);
+        let idx = state.effect_counter.to_be_bytes();
         let frame = plan
             .frames
             .into_iter()
             .next()
             .unwrap_or_else(|| vec![[0, 0, 0]; state.led_state.len()]);
         state.led_state = frame.clone();
-        for pass in 0..STATIC_SEND_PASSES {
-            state.effect_counter = state.effect_counter.wrapping_add(1);
-            let idx = state.effect_counter.to_be_bytes();
-            wireless.send_rgb_direct(&state.mac, &frame, &idx, header_repeats)?;
-            if pass < STATIC_SEND_PASSES - 1 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    STATIC_SEND_PASS_DELAY_MS,
-                ));
-            }
-        }
+        wireless.send_rgb_direct(&state.mac, &frame, &idx, header_repeats)?;
     }
 
     Ok(())
@@ -1982,7 +2109,7 @@ mod tests {
             },
         ];
         let effect = RgbEffect {
-            mode: RgbMode::Meteor,
+            mode: RgbMode::Runway,
             colors: vec![[0xff, 0x00, 0x00]],
             speed: 2,
             brightness: 4,
@@ -1994,12 +2121,10 @@ mod tests {
         let plans = build_wireless_route_render_plans(&wireless_state, &route, 0, &effect);
 
         assert_eq!(plans.len(), 1);
-        // Trail head at row 0 (frame 0): LED index 2 (traversal pos 0, row 0) is lit.
+        // All LEDs in a fan share the same row.  At frame 0 the head is at
+        // the fan's row so BOTH LEDs are lit at head intensity.
         assert_eq!(plans["wireless:a"].frames[0][2], [255, 0, 0]);
-        // LED index 0 (traversal pos 1, row 4) is not yet reached at frame 0.
-        assert_eq!(plans["wireless:a"].frames[0][0], [0, 0, 0]);
-        // By frame 4 the head reaches row 4, so LED index 0 is the head.
-        assert_eq!(plans["wireless:a"].frames[4][0], [255, 0, 0]);
+        assert_eq!(plans["wireless:a"].frames[0][0], [255, 0, 0]);
     }
 
     #[test]
@@ -2035,7 +2160,7 @@ mod tests {
             },
         ];
         let effect = RgbEffect {
-            mode: RgbMode::Meteor,
+            mode: RgbMode::Runway,
             colors: vec![[0x77, 0xaa, 0xff]],
             speed: 2,
             brightness: 4,
@@ -2050,15 +2175,17 @@ mod tests {
         assert_eq!(plans["wireless:a"].frames.len(), WIRELESS_EFFECT_FRAMES);
 
         // Trail sweeps in route order: device A first, then device B.
-        // Frame 0: head at global row 0 → device A, LED index 1 (row 0) is lit.
+        // All LEDs in a fan share the same row.
+        // Frame 0: head at global row 0 → device A, BOTH LEDs lit.
         assert_eq!(plans["wireless:a"].frames[0][1], [0x77, 0xaa, 0xff]);
-        assert_eq!(plans["wireless:a"].frames[0][0], [0, 0, 0]); // row 4, not reached
-        assert_eq!(plans["wireless:b"].frames[0][3], [0, 0, 0]); // row 8, not reached
-        assert_eq!(plans["wireless:b"].frames[0][2], [0, 0, 0]); // row 12, not reached
+        assert_eq!(plans["wireless:a"].frames[0][0], [0x77, 0xaa, 0xff]);
+        assert_eq!(plans["wireless:b"].frames[0][3], [0, 0, 0]); // fan B at row 8
+        assert_eq!(plans["wireless:b"].frames[0][2], [0, 0, 0]); // fan B at row 8
 
-        // Frame 8: head at global row 8 → device B, LED index 3 (row 8) is the head.
-        // Device A, LED index 1 (row 0) is in the trail (distance 8, intensity 0.084).
+        // Frame 8: head at global row 8 → device B, BOTH LEDs lit at head.
+        // Device A at row 0 is in the trail (distance 8, intensity > 0).
         assert_eq!(plans["wireless:b"].frames[8][3], [0x77, 0xaa, 0xff]);
+        assert_eq!(plans["wireless:b"].frames[8][2], [0x77, 0xaa, 0xff]);
         assert_ne!(plans["wireless:a"].frames[8][1], [0, 0, 0]); // still in trail
     }
 
@@ -2090,25 +2217,39 @@ mod tests {
     #[test]
     fn slinf_full_fan_traversal_indexes_follow_zone_led_round_robin_order() {
         let state = WirelessRgbState::new([0; 6], 1, WirelessFanType::SlInf);
-        let traversal = slinf_full_fan_traversal_indexes(&state, 0);
+        let (traversal, offsets, max_offset) =
+            slinf_full_fan_traversal_indexes(&state, 0);
 
         assert_eq!(traversal.len(), 44);
+        assert_eq!(offsets.len(), 44);
+        assert_eq!(max_offset, 10);
         // Zone layout (8,10,8,10,8): round-robin picks one LED per zone per offset.
         assert_eq!(traversal[0], 0);
         assert_eq!(traversal[1], 8);
         assert_eq!(traversal[2], 18);
         assert_eq!(traversal[3], 26);
         assert_eq!(traversal[4], 36);
+        // All 5 LEDs at offset 0 share offset 0
+        assert_eq!(offsets[0], 0);
+        assert_eq!(offsets[1], 0);
+        assert_eq!(offsets[2], 0);
+        assert_eq!(offsets[3], 0);
+        assert_eq!(offsets[4], 0);
         assert_eq!(traversal[5], 1);
         assert_eq!(traversal[6], 9);
         assert_eq!(traversal[7], 19);
         assert_eq!(traversal[8], 27);
         assert_eq!(traversal[9], 37);
+        // All 5 LEDs at offset 1 share offset 1
+        assert_eq!(offsets[5], 1);
+        assert_eq!(offsets[9], 1);
         // Offsets 8-9 only yield 2 LEDs each (from 10-LED zones)
         assert_eq!(traversal[40], 16);
         assert_eq!(traversal[41], 34);
         assert_eq!(traversal[42], 17);
         assert_eq!(traversal[43], 35);
+        assert_eq!(offsets[40], 8);
+        assert_eq!(offsets[42], 9);
         assert!(traversal.contains(&43));
         assert_eq!(*traversal.last().unwrap(), 35);
     }
@@ -2127,8 +2268,14 @@ mod tests {
         let segments = configured_route_segments(&wireless_state, &route, 0, true);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].led_indexes.len(), 44);
+        assert_eq!(segments[0].led_offsets.len(), 44);
+        assert_eq!(segments[0].max_offset, 10);
         assert_eq!(segments[0].led_indexes[0], 0);
         assert_eq!(segments[0].led_indexes[1], 8);
         assert_eq!(segments[0].led_indexes[2], 18);
+        // All first-batch LEDs share offset 0
+        assert_eq!(segments[0].led_offsets[0], 0);
+        assert_eq!(segments[0].led_offsets[1], 0);
+        assert_eq!(segments[0].led_offsets[2], 0);
     }
 }
