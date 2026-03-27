@@ -119,7 +119,7 @@ describe("DashboardPage", () => {
     expect(screen.getByText("desk-cluster")).toBeInTheDocument();
     expect(screen.getByText("4")).toBeInTheDocument();
     expect(screen.getAllByText("healthy").length).toBeGreaterThan(0);
-    expect(screen.getByText("900 / 910 / 920 / 930")).toBeInTheDocument();
+    expect(screen.getByText("900 / 910 / 920 / 930 RPM")).toBeInTheDocument();
     expect(screen.getByText("Static #112233")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Fans" })).toHaveAttribute(
       "href",

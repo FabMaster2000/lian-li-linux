@@ -5,16 +5,18 @@ import {
 } from "./useBackgroundRefresh";
 import { useBackendEventSubscription } from "./useBackendEventSubscription";
 import { disconnectWirelessDevice, listDevices } from "../services/devices";
-import { getFanState } from "../services/fans";
+import { getFanState, previewFanTemperatureSource } from "../services/fans";
 import { getLightingState } from "../services/lighting";
 import { useServerResource } from "../state/server/useServerResource";
-import type { FanStateResponse, LightingStateResponse } from "../types/api";
+import type { FanStateResponse, FanTemperaturePreview, LightingStateResponse } from "../types/api";
 import { buildPairedClusters, type MvpCluster } from "../features/mvpClusters";
 
 type DashboardSnapshot = {
   clusters: MvpCluster[];
   fanStates: Record<string, FanStateResponse | null>;
   lightingStates: Record<string, LightingStateResponse | null>;
+  cpuTemp: FanTemperaturePreview | null;
+  gpuTemp: FanTemperaturePreview | null;
 };
 
 function toErrorMessage(error: unknown, fallback: string) {
@@ -51,7 +53,7 @@ export function useMvpDashboardData() {
   const loadSnapshot = useCallback(async () => {
     const devices = await listDevices();
     const clusters = buildPairedClusters(devices);
-    const [fanStates, lightingStates] = await Promise.all([
+    const [fanStates, lightingStates, cpuTemp, gpuTemp] = await Promise.all([
       loadStateMap(
         clusters,
         (cluster) => cluster.primaryDevice.capabilities.has_fan,
@@ -62,12 +64,16 @@ export function useMvpDashboardData() {
         (cluster) => cluster.primaryDevice.capabilities.has_rgb,
         (cluster) => getLightingState(cluster.primaryDeviceId),
       ),
+      previewFanTemperatureSource("cpu").catch(() => null),
+      previewFanTemperatureSource("gpu").catch(() => null),
     ]);
 
     return {
       clusters,
       fanStates,
       lightingStates,
+      cpuTemp,
+      gpuTemp,
     };
   }, []);
 
@@ -76,6 +82,8 @@ export function useMvpDashboardData() {
       clusters: [],
       fanStates: {},
       lightingStates: {},
+      cpuTemp: null,
+      gpuTemp: null,
     },
     load: loadSnapshot,
     loadErrorMessage: "Dashboard data could not be loaded",
@@ -149,6 +157,8 @@ export function useMvpDashboardData() {
     clusters: resource.data.clusters,
     fanStates: resource.data.fanStates,
     lightingStates: resource.data.lightingStates,
+    cpuTemp: resource.data.cpuTemp,
+    gpuTemp: resource.data.gpuTemp,
     loading: resource.loading,
     refreshing: resource.refreshing,
     error: resource.error,

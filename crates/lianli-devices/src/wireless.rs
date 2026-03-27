@@ -9,7 +9,7 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 const TX_VENDOR: u16 = 0x0416;
@@ -36,10 +36,13 @@ static CMD_RX_LCD_MODE: Lazy<Vec<u8>> = Lazy::new(|| decode_command("10010430"))
 const GET_DEV_TIMEOUT: Duration = Duration::from_millis(1_000);
 const RX_DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
 const RX_PRIME_SETTLE: Duration = Duration::from_millis(50);
-const DISCOVERY_RESCAN_THRESHOLD: u16 = 3;
+const DISCOVERY_RESCAN_THRESHOLD: u16 = 6;
 const DISCOVERY_DEVICE_GRACE_POLLS: u8 = 24;
 const FAN_PWM_SEND_REPEATS: u8 = 3;
 const FAN_PWM_REPEAT_GAP: Duration = Duration::from_millis(5);
+
+/// Duration the TX dongle stays quiet so RX GetDev can succeed.
+const TX_QUIET_WINDOW_MS: u64 = 1200;
 
 fn decode_command(prefix: &str) -> Vec<u8> {
     let mut bytes = hex::decode(prefix).expect("valid hex literal");
@@ -499,6 +502,10 @@ pub struct WirelessController {
     /// Motherboard PWM duty cycle (0-255) extracted from RX GetDev response bytes [2:3].
     /// 0xFFFF means unavailable/not yet read.
     mobo_pwm: Arc<AtomicU16>,
+    /// Deadline until which the TX dongle must not send any RF data so the
+    /// RX polling thread can receive a clean GetDev response from wireless
+    /// fans.  Set by the poll thread before each GetDev cycle.
+    tx_quiet_until: Arc<Mutex<Instant>>,
 }
 
 impl Clone for WirelessController {
@@ -517,6 +524,7 @@ impl Clone for WirelessController {
             locally_detached: Arc::clone(&self.locally_detached),
             discovery_failures: Arc::clone(&self.discovery_failures),
             mobo_pwm: Arc::clone(&self.mobo_pwm),
+            tx_quiet_until: Arc::clone(&self.tx_quiet_until),
         }
     }
 }
@@ -538,6 +546,7 @@ impl WirelessController {
             locally_detached: Arc::new(Mutex::new(HashSet::new())),
             discovery_failures: Arc::new(AtomicU16::new(0)),
             mobo_pwm: Arc::new(AtomicU16::new(0xFFFF)),
+            tx_quiet_until: Arc::new(Mutex::new(Instant::now())),
         };
 
         if let Some(sim) = controller.simulated.as_ref() {
@@ -698,10 +707,26 @@ impl WirelessController {
         let master_channel = Arc::clone(&self.master_channel);
         let discovery_query_channel = Arc::clone(&self.discovery_query_channel);
         let discovery_failures = Arc::clone(&self.discovery_failures);
+        let tx_quiet_until = Arc::clone(&self.tx_quiet_until);
 
         self.poll_thread = Some(thread::spawn(move || {
+            info!("RX poll thread started");
             let mut found_devices = false;
             while !stop_flag.load(Ordering::SeqCst) {
+                // Request a TX quiet window so wireless fans can respond to
+                // the RX GetDev query without RF contention from RGB streaming.
+                {
+                    let deadline = Instant::now() + Duration::from_millis(TX_QUIET_WINDOW_MS);
+                    *tx_quiet_until.lock() = deadline;
+                }
+                // Wait a bit for any in-flight RGB send to finish before
+                // issuing GetDev.
+                thread::sleep(Duration::from_millis(80));
+
+                // Drain stale data from the RX USB buffer so the next
+                // read_bulk gets the actual GetDev response.
+                drain_rx_buffer(&rx);
+
                 if let Err(err) = poll_and_discover(
                     &rx,
                     Some(&tx),
@@ -713,14 +738,19 @@ impl WirelessController {
                     &discovery_failures,
                     false,
                 ) {
-                    warn!("RX polling error: {err:?}");
+                    warn!("RX polling error (thread will exit): {err:?}");
                     break;
                 }
                 if !found_devices && !discovered_devices.lock().is_empty() {
                     found_devices = true;
                 }
-                let interval = if found_devices { 5000 } else { 500 };
+                let interval = if found_devices { 3000 } else { 500 };
                 thread::sleep(Duration::from_millis(interval));
+            }
+            if stop_flag.load(Ordering::SeqCst) {
+                info!("RX poll thread exiting: stop flag set");
+            } else {
+                warn!("RX poll thread exiting: loop ended unexpectedly");
             }
         }));
 
@@ -748,6 +778,15 @@ impl WirelessController {
     pub fn ensure_video_mode(&self) -> Result<()> {
         if self.simulated.is_some() {
             return Ok(());
+        }
+
+        // Respect the TX quiet window so RX GetDev can succeed.
+        {
+            let deadline = *self.tx_quiet_until.lock();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining);
+            }
         }
 
         // L-Connect sends 0x11+prep every ~1.1 s — the TX dongle firmware
@@ -1150,6 +1189,15 @@ impl WirelessController {
 
         let tx = self.tx.as_ref().context("TX device not connected")?;
 
+        // Respect the TX quiet window for RX GetDev.
+        {
+            let deadline = *self.tx_quiet_until.lock();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining);
+            }
+        }
+
         let device = self.discovered_devices
             .lock()
             .iter()
@@ -1323,6 +1371,18 @@ impl WirelessController {
         }
 
         let tx = self.tx.as_ref().context("TX device not connected")?;
+
+        // If the RX polling thread has requested a TX quiet window, wait
+        // for it to expire before sending.  This gives the wireless fans
+        // time to respond to the RX GetDev query without interference.
+        {
+            let deadline = *self.tx_quiet_until.lock();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                debug!("TX quiet window active — delaying RGB send by {}ms", remaining.as_millis());
+                thread::sleep(remaining);
+            }
+        }
 
         // The TX dongle must be in "video mode" before it will relay RF RGB
         // packets to the fans.  ensure_video_mode() is idempotent and fast

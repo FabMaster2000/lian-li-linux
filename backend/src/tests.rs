@@ -1003,7 +1003,8 @@ async fn devices_endpoint_marks_stale_wireless_devices_offline() {
     let device_id = "wireless:test:device";
     let mut device = device_info(device_id, "Sim Device", true, true);
     device.wireless_channel = Some(8);
-    device.wireless_missed_polls = Some(1);
+    // Beyond the grace window (WIRELESS_ONLINE_GRACE_MISSED_POLLS = 2)
+    device.wireless_missed_polls = Some(3);
     let devices = vec![device];
     let telemetry = sample_telemetry(device_id);
     let mock = MockDaemon::new(2, move |request| match request {
@@ -1028,6 +1029,40 @@ async fn devices_endpoint_marks_stale_wireless_devices_offline() {
     assert_eq!(items[0]["health"]["summary"], "Wireless device not seen in the latest discovery poll");
     assert_eq!(items[0]["current_mode_summary"], "Wireless device offline");
     assert_eq!(items[0]["state"]["fan_rpms"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn devices_endpoint_keeps_wireless_device_online_during_grace_window() {
+    let device_id = "wireless:test:device";
+    let mut device = device_info(device_id, "Sim Device", true, true);
+    device.wireless_channel = Some(8);
+    device.fan_count = Some(4);
+    // Within grace window — device should remain online with RPMs visible
+    device.wireless_missed_polls = Some(2);
+    let devices = vec![device];
+    let telemetry = sample_telemetry(device_id);
+    let mock = MockDaemon::new(2, move |request| match request {
+        IpcRequest::ListDevices => IpcResponse::ok(devices.clone()),
+        IpcRequest::GetTelemetry => IpcResponse::ok(telemetry.clone()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let response = mock
+        .app()
+        .oneshot(empty_request(Method::GET, "/api/devices"))
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = read_json(response).await;
+    let items = body.as_array().expect("device array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], device_id);
+    assert_eq!(items[0]["online"], json!(true));
+    assert_eq!(items[0]["health"]["level"], "healthy");
+    assert_ne!(items[0]["state"]["fan_rpms"], serde_json::Value::Null);
+    let rpms = items[0]["state"]["fan_rpms"].as_array().expect("fan_rpms array");
+    assert_eq!(rpms.len(), 4);
 }
 #[tokio::test]
 async fn devices_endpoint_returns_bad_gateway_when_daemon_transport_fails() {

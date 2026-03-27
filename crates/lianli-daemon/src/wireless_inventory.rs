@@ -3,6 +3,12 @@ use lianli_shared::device_id::DeviceFamily;
 use lianli_shared::ipc::{DeviceInfo, WirelessBindingState};
 use std::collections::HashMap;
 
+/// Number of consecutive missed discovery polls during which we still
+/// carry forward the last-known fan RPMs into the telemetry map.
+/// This prevents transient RF misses (e.g. during RGB streaming) from
+/// flickering the dashboard RPMs to "n/a".
+pub const RPM_GRACE_MISSED_POLLS: u8 = 2;
+
 pub fn build_wireless_inventory(
     wireless: &WirelessController,
 ) -> (Vec<DeviceInfo>, HashMap<String, Vec<u16>>) {
@@ -14,7 +20,7 @@ pub fn build_wireless_inventory(
         let device_id = format!("wireless:{}", dev.mac_str());
         let locally_detached = wireless.is_locally_detached(&dev.mac);
         let binding_state = wireless_binding_state(&master_mac, &dev, locally_detached);
-        if dev.missed_polls == 0 {
+        if dev.missed_polls <= RPM_GRACE_MISSED_POLLS {
             let rpms: Vec<u16> = dev.fan_rpms[..dev.fan_count as usize].to_vec();
             telemetry.insert(device_id.clone(), rpms);
         }
@@ -117,5 +123,63 @@ mod tests {
             wireless_binding_state(&master, &device, true),
             WirelessBindingState::Available
         );
+    }
+
+    #[test]
+    fn rpms_included_in_telemetry_when_no_missed_polls() {
+        let mut dev = test_device([1, 2, 3, 4, 5, 6]);
+        dev.fan_rpms = [750, 0, 0, 0];
+        dev.fan_count = 1;
+        dev.missed_polls = 0;
+
+        let devices = vec![dev];
+        let telemetry = build_telemetry_from_devices(&devices);
+
+        let key = format!("wireless:{}", devices[0].mac_str());
+        assert!(telemetry.contains_key(&key), "RPMs should be present with 0 missed polls");
+        assert_eq!(telemetry[&key], vec![750]);
+    }
+
+    #[test]
+    fn rpms_included_in_telemetry_during_grace_window() {
+        let mut dev = test_device([1, 2, 3, 4, 5, 6]);
+        dev.fan_rpms = [680, 0, 0, 0];
+        dev.fan_count = 1;
+        dev.missed_polls = RPM_GRACE_MISSED_POLLS; // at the boundary
+
+        let devices = vec![dev];
+        let telemetry = build_telemetry_from_devices(&devices);
+
+        let key = format!("wireless:{}", devices[0].mac_str());
+        assert!(telemetry.contains_key(&key), "RPMs should be present within grace window");
+        assert_eq!(telemetry[&key], vec![680]);
+    }
+
+    #[test]
+    fn rpms_excluded_from_telemetry_beyond_grace_window() {
+        let mut dev = test_device([1, 2, 3, 4, 5, 6]);
+        dev.fan_rpms = [680, 0, 0, 0];
+        dev.fan_count = 1;
+        dev.missed_polls = RPM_GRACE_MISSED_POLLS + 1;
+
+        let devices = vec![dev];
+        let telemetry = build_telemetry_from_devices(&devices);
+
+        let key = format!("wireless:{}", devices[0].mac_str());
+        assert!(!telemetry.contains_key(&key), "RPMs should be absent beyond grace window");
+    }
+
+    /// Helper: builds the telemetry map from a Vec<DiscoveredDevice>
+    /// without needing a full WirelessController.
+    fn build_telemetry_from_devices(devices: &[DiscoveredDevice]) -> HashMap<String, Vec<u16>> {
+        let mut telemetry = HashMap::new();
+        for dev in devices {
+            let device_id = format!("wireless:{}", dev.mac_str());
+            if dev.missed_polls <= RPM_GRACE_MISSED_POLLS {
+                let rpms: Vec<u16> = dev.fan_rpms[..dev.fan_count as usize].to_vec();
+                telemetry.insert(device_id, rpms);
+            }
+        }
+        telemetry
     }
 }

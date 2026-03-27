@@ -17,22 +17,39 @@ export function DashboardPage() {
     clusters,
     fanStates,
     lightingStates,
+    cpuTemp,
+    gpuTemp,
     loading,
     refreshing,
     error,
     actionError,
     actionSuccess,
     disconnectingClusterId,
+    lastUpdated,
     refresh,
     disconnectCluster,
   } = useMvpDashboardData();
+
+  const formatTemp = (preview: typeof cpuTemp) =>
+    preview?.available && preview.celsius != null
+      ? `${preview.celsius.toFixed(1)} °C`
+      : "n/a";
+
+  const formatRpm = (rpms: number[] | null | undefined) => {
+    const text = summarizeFanRpm(rpms);
+    return text === "n/a" ? text : `${text} RPM`;
+  };
+
+  const freshness = lastUpdated
+    ? `Zuletzt aktualisiert: ${new Date(lastUpdated).toLocaleTimeString("de-DE")}`
+    : undefined;
 
   return (
     <main className="page-shell">
       <PageIntro
         eyebrow="dashboard"
         title="Dashboard"
-        description="Nur aktuell gekoppelte Wireless-Cluster werden hier angezeigt."
+        description={freshness ?? "Nur aktuell gekoppelte Wireless-Cluster werden hier angezeigt."}
         aside={
           <button className="refresh-button" onClick={() => void refresh()} type="button">
             {refreshing ? "Aktualisiere..." : "Aktualisieren"}
@@ -69,6 +86,21 @@ export function DashboardPage() {
           message="Derzeit sind keine Wireless-Cluster gekoppelt."
         />
       ) : (
+        <>
+        <section className="system-temps">
+          <Card className="temp-card">
+            <dl className="detail-list detail-list--compact">
+              <div>
+                <dt>CPU-Temperatur</dt>
+                <dd>{formatTemp(cpuTemp)}</dd>
+              </div>
+              <div>
+                <dt>GPU-Temperatur</dt>
+                <dd>{formatTemp(gpuTemp)}</dd>
+              </div>
+            </dl>
+          </Card>
+        </section>
         <section className="device-grid">
           {clusters.map((cluster) => (
             <Card className="device-card" key={cluster.id}>
@@ -94,7 +126,7 @@ export function DashboardPage() {
                 <div>
                   <dt>Aktuelle Drehzahl</dt>
                   <dd>
-                    {summarizeFanRpm(
+                    {formatRpm(
                       fanStates[cluster.id]?.rpms ?? cluster.primaryDevice.state.fan_rpms,
                     )}
                   </dd>
@@ -124,6 +156,7 @@ export function DashboardPage() {
             </Card>
           ))}
         </section>
+        </>
       )}
     </main>
   );

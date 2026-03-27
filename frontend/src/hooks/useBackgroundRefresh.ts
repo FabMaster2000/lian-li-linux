@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-export const LIVE_STATUS_REFRESH_INTERVAL_MS = 5000;
+export const LIVE_STATUS_REFRESH_INTERVAL_MS = 3000;
 
 export function useBackgroundRefresh(
   refresh: () => Promise<unknown> | void,

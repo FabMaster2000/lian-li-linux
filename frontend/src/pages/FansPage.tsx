@@ -286,6 +286,14 @@ export function FansPage() {
             </button>
             <button
               className="button-link"
+              disabled={applyDisabled || clusters.length === 0}
+              onClick={() => void applyChanges(true)}
+              type="button"
+            >
+              Auf alle Cluster übertragen
+            </button>
+            <button
+              className="button-link"
               disabled={!dirty || applying}
               onClick={resetDraft}
               type="button"

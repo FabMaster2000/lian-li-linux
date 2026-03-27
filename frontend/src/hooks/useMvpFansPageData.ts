@@ -223,7 +223,7 @@ export function useMvpFansPageData(
     LIVE_STATUS_REFRESH_INTERVAL_MS,
   );
 
-  const applyChanges = useCallback(async () => {
+  const applyChanges = useCallback(async (applyToAll = false) => {
     if (!selectedCluster) {
       setError("Kein Cluster ausgewählt");
       return false;
@@ -257,24 +257,28 @@ export function useMvpFansPageData(
         }
 
         await applyFanWorkbench({
-          target_mode: "selected",
+          target_mode: applyToAll ? "all" : "selected",
           device_id: selectedCluster.primaryDeviceId,
-          device_ids: selectedCluster.deviceIds,
+          device_ids: applyToAll ? [] : selectedCluster.deviceIds,
           mode: "curve",
           curve: curveName,
         });
       } else {
         await applyFanWorkbench({
-          target_mode: "selected",
+          target_mode: applyToAll ? "all" : "selected",
           device_id: selectedCluster.primaryDeviceId,
-          device_ids: selectedCluster.deviceIds,
+          device_ids: applyToAll ? [] : selectedCluster.deviceIds,
           mode: "manual",
           percent: clampPercent(draft.manualPercent),
         });
       }
 
       await loadClusterState(selectedCluster, { syncDraft: true });
-      setSuccess("Lüftereinstellungen wurden erfolgreich gespeichert.");
+      setSuccess(
+        applyToAll
+          ? "Lüftereinstellungen wurden auf alle Cluster übertragen."
+          : "Lüftereinstellungen wurden erfolgreich gespeichert.",
+      );
       return true;
     } catch (nextError) {
       setError(toErrorMessage(nextError, "Lüftereinstellungen konnten nicht gespeichert werden"));

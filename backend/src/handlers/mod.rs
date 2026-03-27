@@ -1756,8 +1756,14 @@ fn health_state(
     }
 }
 
+/// Tolerate up to this many consecutive missed wireless polls before
+/// marking a device offline.  Must match the daemon's
+/// `RPM_GRACE_MISSED_POLLS` constant so both layers agree on when
+/// telemetry is still considered fresh.
+const WIRELESS_ONLINE_GRACE_MISSED_POLLS: u8 = 2;
+
 fn device_online(device: &DeviceInfo, telemetry_fan_rpms: &Option<Vec<u16>>) -> bool {
-    if device.wireless_missed_polls.unwrap_or(0) > 0 {
+    if device.wireless_missed_polls.unwrap_or(0) > WIRELESS_ONLINE_GRACE_MISSED_POLLS {
         return false;
     }
 

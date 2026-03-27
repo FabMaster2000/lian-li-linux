@@ -475,13 +475,14 @@ fn drm_gpu_temperatures() -> Result<Vec<f32>> {
 }
 
 fn read_nvidia_smi_temperature() -> Result<f32> {
-    let output = Command::new("nvidia-smi")
+    let nvidia_smi = find_nvidia_smi().context("nvidia-smi not found")?;
+    let output = Command::new(&nvidia_smi)
         .args([
             "--query-gpu=temperature.gpu",
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .context("executing nvidia-smi")?;
+        .with_context(|| format!("executing {}", nvidia_smi.display()))?;
 
     if !output.status.success() {
         anyhow::bail!("nvidia-smi failed with status {}", output.status);
@@ -494,6 +495,30 @@ fn read_nvidia_smi_temperature() -> Result<f32> {
         .collect::<Vec<_>>();
 
     select_temperature(values, "GPU")
+}
+
+/// Locate `nvidia-smi` — try `PATH` first, then well-known locations that
+/// may not be on the daemon's `PATH` (e.g. `/usr/lib/wsl/lib` in WSL2).
+fn find_nvidia_smi() -> Option<PathBuf> {
+    // Try PATH first (works when nvidia-smi is on PATH)
+    if Command::new("nvidia-smi").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return Some(PathBuf::from("nvidia-smi"));
+    }
+
+    // Well-known fallback locations (WSL2, standard Linux installs)
+    let candidates = [
+        "/usr/lib/wsl/lib/nvidia-smi",
+        "/usr/bin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 fn execute_temperature_command(command: &str) -> Result<f32> {
